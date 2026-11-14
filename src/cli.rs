@@ -13,6 +13,7 @@ use crate::state::{
     clear_state, force_kill, home_dir, is_loopback, log_path, pid_alive, read_state, state_dir,
     terminate, write_state, DEFAULT_PORT, SPACE_PORT,
 };
+use crate::config;
 use crate::update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -27,6 +28,7 @@ struct Flags {
     follow: bool,
     check: bool,
     tag: Option<String>,
+    init: bool,
     positionals: Vec<String>,
 }
 
@@ -47,17 +49,19 @@ Commands:
   logs        print the bridge log (-f to follow)
   token       print the FreePi JWT the bridge uses
   ads         print the ad page URL
+  config      show the config file (--init = create it if missing)
   update      install the latest release (--check = report only)
   version     print the version
 
 Flags:
-  --port N          listen port (default 8787; 7860 on a Space)
-  --bind H          listen address (default 127.0.0.1; 0.0.0.0 on a Space)
+  --port N          listen port (default 8787)
+  --bind H          listen address (default 127.0.0.1)
   --bg              detach after starting
   --json            machine-readable output (status, models, doctor)
   --insecure        allow a non-loopback bind without BRIDGE_API_KEY
   --check           only report whether a newer release exists (update)
   --tag TAG         install a specific release (update, e.g. v0.1.2)
+  --init            create the config file if it is missing (config)
   -f, --follow      follow the log
   -h, --help        this help; \"freepi-bridge <command> --help\" per command
   -V, --version     print the version
@@ -76,6 +80,7 @@ Environment:
 Defaults:
   port {DEFAULT_PORT}, bind 127.0.0.1, state in ~/.freepi-bridge/,
   log in ~/.freepi-bridge/bridge.log
+  settings in ~/.freepi-bridge/config.env; exported variables win over it
 
 Exit codes: 0 success, 1 error (daemon down, bad flags, failed check).
 "
@@ -93,6 +98,7 @@ fn command_help(command: &str) -> bool {
         "logs" => "freepi-bridge logs [-f]",
         "token" => "freepi-bridge token",
         "ads" => "freepi-bridge ads",
+        "config" => "freepi-bridge config [--init]",
         "update" => "freepi-bridge update [--check] [--tag vX.Y.Z]",
         "version" => "freepi-bridge version",
         _ => return false,
@@ -112,6 +118,7 @@ fn parse(argv: Vec<String>) -> Result<Flags, String> {
             "--insecure" => flags.insecure = true,
             "--follow" | "-f" => flags.follow = true,
             "--check" => flags.check = true,
+            "--init" => flags.init = true,
             "--tag" => {
                 index += 1;
                 let value = argv.get(index).ok_or("--tag needs a release tag, e.g. v0.1.2")?;
@@ -279,6 +286,10 @@ fn guard_bind(host: &str, insecure: bool) -> bool {
 }
 
 async fn cmd_start(flags: Flags) -> i32 {
+    if let Err(err) = config::ensure_file() {
+        eprintln!("cannot create {}: {err}", config::config_path().display());
+    }
+
     let host = flags.bind.clone().unwrap_or_else(default_host);
     let port = flags.port.unwrap_or_else(default_port);
     let insecure = flags.insecure || env_nonempty("FREEPI_BRIDGE_INSECURE").as_deref() == Some("1");
@@ -514,6 +525,42 @@ fn cmd_ads(flags: Flags) -> i32 {
     }
     println!("{url}");
     0
+}
+
+fn cmd_config(flags: Flags) -> i32 {
+    let path = config::config_path();
+    match config::ensure_file() {
+        Ok(true) => println!("created {}", path.display()),
+        Ok(false) => {
+            if flags.init {
+                println!("config already at {}", path.display());
+            } else {
+                println!("config {}", path.display());
+            }
+        }
+        Err(err) => {
+            eprintln!("cannot create {}: {err}", path.display());
+            return 1;
+        }
+    }
+    if flags.init {
+        return 0;
+    }
+    println!();
+
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("cannot read {}: {err}", path.display());
+            1
+        }
+    }
 }
 
 fn cmd_logs(flags: Flags) -> i32 {
@@ -925,6 +972,7 @@ pub(crate) async fn run(argv: Vec<String>) -> i32 {
         "logs" => cmd_logs(flags),
         "token" => cmd_token(),
         "ads" => cmd_ads(flags),
+        "config" => cmd_config(flags),
         "update" => cmd_update(flags).await,
         other => {
             eprintln!("freepi-bridge: unknown command \"{other}\" (try \"freepi-bridge help\")");

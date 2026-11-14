@@ -40,7 +40,7 @@ npm install -g free-pi-cli
 free-pi-cli
 ```
 
-Di mesin yang tidak bisa menjalankan Node atau browser (container, Space, CI runner), lewati CLI dan kirim JWT langsung:
+Di mesin yang tidak bisa menjalankan Node atau browser (container, CI runner), lewati CLI dan kirim JWT langsung:
 
 ```bash
 FREEPI_TOKEN=eyJ... freepi-bridge start --bg
@@ -105,7 +105,7 @@ irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.
 .\install.ps1 -Uninstall
 ```
 
-`-Uninstall` menghentikan daemon, menghapus `%LOCALAPPDATA%\Programs\freepi-bridge`, membuang folder itu dari PATH pengguna, dan menghapus `%USERPROFILE%\.freepi-bridge`. Tambahkan `-KeepState` untuk mempertahankan direktori state dan log-nya, dan `-Prefix <dir>` kalau kamu memasang di tempat lain. Pemakaian lewat pipe juga jalan: setel `$env:FREEPI_BRIDGE_UNINSTALL='1'` sebelum `irm … | iex`.
+`-Uninstall` menghentikan daemon, menghapus `%LOCALAPPDATA%\Programs\freepi-bridge`, membuang folder itu dari PATH pengguna, dan menghapus `%USERPROFILE%\.freepi-bridge`. Tambahkan `-KeepState` untuk mempertahankan direktori state beserta log dan config-nya, dan `-Prefix <dir>` kalau kamu memasang di tempat lain. Pemakaian lewat pipe juga jalan: setel `$env:FREEPI_BRIDGE_UNINSTALL='1'` sebelum `irm … | iex`.
 
 Kedua jalur tidak menyentuh `~/.free-pi`; direktori itu milik CLI FreePi resmi.
 
@@ -156,7 +156,7 @@ Invoke-RestMethod http://127.0.0.1:8787/v1/chat/completions `
 
 Bridge memakai ulang JWT akun yang sudah disimpan CLI FreePi resmi di `~/.free-pi/agent/credentials.json`. Kalau `freepi-bridge token` tidak mencetak apa pun, lihat [Prasyarat](#prasyarat).
 
-Kalau completion menjawab `403 ads_required` karena tidak ada browser yang bisa membuka `/ads` (container, VM, mesin remote), nyalakan daemon dengan `FREEPI_AUTO_AD=1`. Lihat [Mengaktifkannya](#mengaktifkannya).
+Bridge melaporkan iklan sendiri, jadi container, VM atau mesin remote tetap dapat completion tanpa browser; `FREEPI_AUTO_AD=0` mematikannya dan meninggalkan `/ads` sebagai satu-satunya cara membersihkan `403 ads_required`. Lihat [Laporan otomatis](#laporan-otomatis).
 
 ## Perintah
 
@@ -171,6 +171,7 @@ Kalau completion menjawab `403 ads_required` karena tidak ada browser yang bisa 
 | `freepi-bridge logs [-f]` | Cetak 200 baris log terakhir; `-f` mengikuti |
 | `freepi-bridge token` | Cetak JWT yang dipakai bridge |
 | `freepi-bridge ads` | Cetak URL halaman iklan, beserta key kalau ada |
+| `freepi-bridge config [--init]` | Cetak file config lokal; `--init` membuatnya kalau belum ada |
 | `freepi-bridge update [--check] [--tag TAG]` | Pasang rilis terbaru di tempat; `--check` hanya melapor, `--tag` mengunci satu rilis |
 | `freepi-bridge version`, `--version` | Cetak versi |
 | `freepi-bridge help`, `--help` | Bantuan global; `<perintah> --help` untuk satu perintah |
@@ -179,20 +180,43 @@ Exit code `0` kalau berhasil dan `1` kalau gagal: daemon mati, flag salah, pemer
 
 ### Environment
 
+Semua variabel di sini juga bisa disimpan di [file config](#konfigurasi); environment tetap menang.
+
 | Variabel | Default | Efek |
 |---|---|---|
 | `FREEPI_BASE_URL` | `https://api.freepi.ai` | API upstream |
 | `FREEPI_TOKEN` | tidak disetel | JWT akun; menimpa file credentials |
 | `FREEPI_CREDENTIALS` | `~/.free-pi/agent/credentials.json` | File token yang ditulis CLI resmi |
 | `BRIDGE_API_KEY` | tidak disetel | Key bersama yang harus dikirim klien; juga mengunci `/ads` |
-| `HOST`, `PORT` | `127.0.0.1`, `8787` (`0.0.0.0`, `7860` di Space) | Alamat listen |
+| `HOST`, `PORT` | `127.0.0.1`, `8787` | Alamat listen |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | Direktori state dan log |
 | `FREEPI_BRIDGE_INSECURE` | tidak disetel | `1` berperilaku seperti `--insecure` |
-| `FREEPI_AUTO_AD` | `0` | `1` nyala, `0` mati; bridge melaporkan iklan tanpa halaman iklan |
+| `FREEPI_AUTO_AD` | `1` | `1` nyala secara default, `0` mati; bridge melaporkan iklan tanpa halaman iklan |
 | `FREEPI_AD_REFRESH_SECS` | `600` | Jeda antar laporan iklan otomatis; nilai di bawah 30 diabaikan |
 | `FREEPI_AUTO_UPDATE` | tidak disetel | `start --bg` memeriksa sekali sehari: tidak disetel = cetak pemberitahuan, `1` = pasang otomatis, `0` = tidak pernah memeriksa |
 | `FREEPI_BRIDGE_DOWNLOAD_BASE` | rilis GitHub | URL mirror untuk unduhan update |
-| `TZ` | zona waktu sistem | Dikirim sebagai `x-client-timezone` pada permintaan iklan |
+| `TZ` | `UTC` | Dikirim sebagai `x-client-timezone` pada permintaan iklan |
+
+## Konfigurasi
+
+Setelan bisa disimpan di `~/.freepi-bridge/config.env` (atau `$FREEPI_BRIDGE_DIR/config.env`) sebagai ganti shell, jadi daemon yang dijalankan supervisor, cron job, atau setelah reboot tetap memakai setelan yang sama. Kedua installer membuat file ini, dan `start` biasa juga membuatnya, jadi selalu ada yang bisa diedit. File ditulis `0600` di Linux dan macOS (Windows memakai ACL bawaan pengguna) karena bisa berisi `FREEPI_TOKEN` atau `BRIDGE_API_KEY`.
+
+```ini
+# freepi-bridge configuration
+FREEPI_AUTO_AD=1
+FREEPI_AD_REFRESH_SECS=300
+BRIDGE_API_KEY=
+# PORT=8787
+```
+
+Satu `KEY=VALUE` per baris, `#` memulai komentar (beri spasi sebelumnya, atau kutip nilainya, supaya `#` di dalam nilai tetap utuh), dan tanda kutip berpasangan di sekitar nilai dihapus. Key yang tidak dikenal dilaporkan di stderr dan diabaikan, jadi salah ketik tidak diam-diam mengubah cara bridge berjalan. Environment asli menang atas file, sehingga override sekali pakai tetap jalan (`FREEPI_AUTO_AD=0 freepi-bridge start --bg`). Perubahan berlaku saat start berikutnya: `freepi-bridge restart`.
+
+```bash
+freepi-bridge config            # cetak path dan isi file saat ini
+freepi-bridge config --init     # buat kalau belum ada; tidak pernah menimpa
+```
+
+`FREEPI_BRIDGE_DIR` satu-satunya variabel yang tidak bisa disetel dari file, karena dialah yang menentukan lokasi file dibaca.
 
 ## Update
 
@@ -221,9 +245,9 @@ Perintah yang sama jalan di Linux x86_64/aarch64, macOS arm64/x86_64 dan Windows
 
 Bridge mencari token dengan urutan ini:
 
-1. `FREEPI_TOKEN`
-2. file credentials (`FREEPI_CREDENTIALS`, kalau tidak ada `~/.free-pi/agent/credentials.json`)
-3. JWT dari klien di `Authorization: Bearer eyJ...`, hanya diterima kalau `BRIDGE_API_KEY` tidak disetel
+1. JWT dari klien di `Authorization: Bearer eyJ...`, hanya diterima kalau `BRIDGE_API_KEY` tidak disetel
+2. `FREEPI_TOKEN`
+3. file credentials (`FREEPI_CREDENTIALS`, kalau tidak ada `~/.free-pi/agent/credentials.json`)
 
 ## Iklan
 
@@ -241,26 +265,24 @@ Biarkan halaman tetap terbuka selama kamu bekerja. Melaporkan impression untuk c
 
 ### Host tanpa layar
 
-`/ads` hanya mendengarkan di port bridge sendiri. Container, Space atau CI runner tidak bisa membukanya, jadi bridge tidak pernah melaporkan iklan dan FreePi menjawab `403 ads_required`. `FREEPI_AUTO_AD=1` membuat bridge melaporkan iklan sendiri dan mengulang satu completion yang terhalang sekali. `0` atau tidak disetel membiarkan akun apa adanya.
+`/ads` hanya mendengarkan di port bridge sendiri. Container atau CI runner tidak bisa membukanya, jadi bridge melaporkan iklan sendiri dan mengulang satu completion yang terhalang sekali; itulah kerja `FREEPI_AUTO_AD`, dan itu sebabnya ia nyala sejak awal. `FREEPI_AUTO_AD=0` membiarkan akun apa adanya, dan host seperti itu akan terus menjawab `403 ads_required`.
 
-### Mengaktifkannya
+### Laporan otomatis
 
-`FREEPI_AUTO_AD` dibaca sekali, saat proses mulai; tidak ada yang disimpan ke file config. Variabel itu harus ada di environment perintah yang menjalankan daemon.
+Bridge melaporkan iklan sendiri setiap `FREEPI_AD_REFRESH_SECS` detik, jadi completion tetap jalan di container, CI runner, atau host mana pun yang tidak bisa membuka `/ads`. `FREEPI_AUTO_AD` dibaca sekali, saat proses mulai, dari environment atau [file config](#konfigurasi); `0` mematikan laporan otomatis.
 
 ```bash
 freepi-bridge token          # kosong? lihat Prasyarat
-
-FREEPI_AUTO_AD=1 FREEPI_AD_REFRESH_SECS=300 freepi-bridge start --bg
-
+freepi-bridge start --bg
 freepi-bridge logs | grep 'ad impression'
 # ad impression reported (session ..., gravity false)
 ```
 
-`start --bg` menyalin environment-nya ke child yang terlepas, jadi kedua variabel ikut. `restart` membaca ulang keduanya dari shell yang menjalankannya, bukan dari daemon yang digantikannya: `FREEPI_AUTO_AD=1 freepi-bridge restart` tetap melaporkan, sedangkan `freepi-bridge restart` tanpa variabel mematikannya. Ekspor di `~/.profile` supaya tidak mengetiknya terus (`export FREEPI_AUTO_AD=1`, `export FREEPI_AD_REFRESH_SECS=300`). Supervisor bekerja dengan cara yang sama: `Environment=FREEPI_AUTO_AD=1` di unit systemd, `-e FREEPI_AUTO_AD=1` untuk `docker run`.
+`start --bg` menyalin environment-nya ke child yang terlepas, jadi setelan itu ikut. `restart` membaca ulang shell dan file config perintah yang menjalankannya, bukan daemon yang digantikannya, sehingga `FREEPI_AUTO_AD=0 freepi-bridge restart` memakai tampilan iklan asli untuk satu kali jalan; tulis `FREEPI_AUTO_AD=0` di `~/.freepi-bridge/config.env` supaya permanen. Supervisor bekerja dengan cara yang sama: `Environment=FREEPI_AUTO_AD=0` di unit systemd, `-e FREEPI_AUTO_AD=0` untuk `docker run`.
 
-`freepi-bridge stop` lalu `start` tanpa variabel mematikan pelaporan lagi; `FREEPI_AUTO_AD=0` melakukan hal yang sama.
+`freepi-bridge ads` mencetak halaman yang bisa dibuka kalau kamu lebih suka melihat iklannya sungguhan.
 
-Flag ini melaporkan iklan yang tidak pernah ditampilkan bridge. Pakai hanya di tempat halaman iklan tidak bisa dijangkau.
+Laporan otomatis mengklaim iklan yang tidak pernah dilihat siapa pun, itu penipuan impression dan bisa membuat akun ditinjau; setel `FREEPI_AUTO_AD=0` di mesin mana pun yang browsernya bisa membiarkan `/ads` terbuka.
 
 ## Docker
 
@@ -278,7 +300,7 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Container berjalan sebagai pengguna non-root, bind ke `0.0.0.0:7860`, dan membawa healthcheck `/health`. State tetap di luar container; token datang lewat `FREEPI_TOKEN`.
+Container berjalan sebagai pengguna non-root, bind ke `0.0.0.0:7860`, dan membawa healthcheck `/health`. Karena bind ke `0.0.0.0`, bridge mewajibkan `BRIDGE_API_KEY` (atau `FREEPI_BRIDGE_INSECURE=1`), jadi run tanpa salah satunya langsung berhenti. State dan `config.env` berada di dalam container; mount `/home/bridge/.freepi-bridge` kalau mau keduanya bertahan setelah rebuild. Token datang lewat `FREEPI_TOKEN`.
 
 ## Pengembangan
 
@@ -289,8 +311,6 @@ PREFIX=/tmp/out ./install.sh     # build lokal, tanpa unduh rilis
 ```
 
 MSRV 1.89, ditentukan oleh `uuid` 1.29. CI menjalankan test suite di stable dan di 1.89, jadi badge tidak bisa melenceng tanpa build merah.
-
-Tag memicu rilis. `git tag v0.1.0 && git push --tags` menjalankan `release.yml`, yang membangun tarball statis `linux-x86_64` dan `linux-aarch64`, tarball `macos-x86_64` dan `macos-aarch64`, serta zip `windows-x86_64`, masing-masing dengan `.sha256` di sebelahnya.
 
 Diukur pada i5-13420H terhadap upstream mock lokal dengan 50 koneksi bersamaan: sekitar 30k req/s, tambahan 1.5 ms p50 per request, RSS 6.8 MB, binary 2.8 MB. Completion FreePi sungguhan butuh beberapa detik, jadi hop proxy tidak terasa di praktik.
 

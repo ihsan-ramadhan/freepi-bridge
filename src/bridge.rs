@@ -166,7 +166,7 @@ impl State {
 
     async fn report_ad(&self, token: &str, session: &str) -> bool {
         let (version, _) = self.meta(Some(token)).await;
-        let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
+        let timezone = env_nonempty("TZ").unwrap_or_else(|| "UTC".to_string());
         let request = self
             .http
             .get(format!("{}/ads/next?slot=banner", self.cfg.base_url))
@@ -505,7 +505,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
             return Ok(json_error(StatusCode::BAD_REQUEST, "Unknown ad slot", "bad_request"));
         }
         let (version, _) = state.meta(Some(&token)).await;
-        let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
+        let timezone = env_nonempty("TZ").unwrap_or_else(|| "UTC".to_string());
 
         let upstream = state
             .http
@@ -564,8 +564,7 @@ fn credentials_path() -> PathBuf {
     if let Some(path) = env_nonempty("FREEPI_CREDENTIALS") {
         return PathBuf::from(path);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".free-pi/agent/credentials.json")
+    crate::state::home_dir().join(".free-pi/agent/credentials.json")
 }
 
 pub(crate) fn build_state() -> State {
@@ -577,7 +576,12 @@ pub(crate) fn build_state() -> State {
         token: env_nonempty("FREEPI_TOKEN"),
         bridge_key: env_nonempty("BRIDGE_API_KEY"),
         credentials: credentials_path(),
-        auto_ad: matches!(env_nonempty("FREEPI_AUTO_AD").as_deref(), Some("1") | Some("true")),
+        auto_ad: !matches!(
+            env_nonempty("FREEPI_AUTO_AD")
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        ),
         ad_refresh: env_nonempty("FREEPI_AD_REFRESH_SECS")
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|secs| *secs >= 30)

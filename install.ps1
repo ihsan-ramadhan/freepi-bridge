@@ -173,6 +173,7 @@ try {
   Write-Step "installed $destination"
   Add-ToUserPath $Prefix
   & $destination --version
+  & $destination config --init
 } finally {
   Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
 }

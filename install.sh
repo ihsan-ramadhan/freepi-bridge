@@ -62,6 +62,8 @@ install_binary() {
     *) say "note: add $PREFIX/bin to PATH: export PATH=\"$PREFIX/bin:\$PATH\"" ;;
   esac
   "$PREFIX/bin/freepi-bridge" --version
+  "$PREFIX/bin/freepi-bridge" config --init </dev/null \
+    || say "note: could not create the config file; \"freepi-bridge config --init\" retries"
 }
 
 platform_asset() {

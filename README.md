@@ -40,7 +40,7 @@ npm install -g free-pi-cli
 free-pi-cli
 ```
 
-On a machine that cannot run Node or a browser (a container, a Space, a CI runner), skip the CLI and pass the JWT directly:
+On a machine that cannot run Node or a browser (a container, a CI runner), skip the CLI and pass the JWT directly:
 
 ```bash
 FREEPI_TOKEN=eyJ... freepi-bridge start --bg
@@ -105,7 +105,7 @@ irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.
 .\install.ps1 -Uninstall
 ```
 
-`-Uninstall` stops the daemon, deletes `%LOCALAPPDATA%\Programs\freepi-bridge`, removes that folder from the user PATH, and deletes `%USERPROFILE%\.freepi-bridge`. Add `-KeepState` to keep the state directory and its log, and `-Prefix <dir>` if you installed somewhere else. Piped usage works too: set `$env:FREEPI_BRIDGE_UNINSTALL='1'` before `irm … | iex`.
+`-Uninstall` stops the daemon, deletes `%LOCALAPPDATA%\Programs\freepi-bridge`, removes that folder from the user PATH, and deletes `%USERPROFILE%\.freepi-bridge`. Add `-KeepState` to keep the state directory with its log and config, and `-Prefix <dir>` if you installed somewhere else. Piped usage works too: set `$env:FREEPI_BRIDGE_UNINSTALL='1'` before `irm … | iex`.
 
 Both paths leave `~/.free-pi` alone; that directory belongs to the official FreePi CLI.
 
@@ -156,7 +156,7 @@ Invoke-RestMethod http://127.0.0.1:8787/v1/chat/completions `
 
 The bridge reuses the account JWT that the official FreePi CLI already stored in `~/.free-pi/agent/credentials.json`. If `freepi-bridge token` prints nothing, see [Prerequisites](#prerequisites).
 
-If completions answer `403 ads_required` because no browser can reach `/ads` (container, VM, remote box), start the daemon with `FREEPI_AUTO_AD=1` instead. See [Turning it on](#turning-it-on).
+The bridge reports ads by itself, so a container, VM or remote box gets completions without a browser; `FREEPI_AUTO_AD=0` turns that off and leaves `/ads` as the only way to clear `403 ads_required`. See [Automatic reports](#automatic-reports).
 
 ## Commands
 
@@ -171,6 +171,7 @@ If completions answer `403 ads_required` because no browser can reach `/ads` (co
 | `freepi-bridge logs [-f]` | Print the last 200 log lines; `-f` follows |
 | `freepi-bridge token` | Print the JWT the bridge uses |
 | `freepi-bridge ads` | Print the ad page URL, with the key when one is set |
+| `freepi-bridge config [--init]` | Print the local config file; `--init` creates it when it is missing |
 | `freepi-bridge update [--check] [--tag TAG]` | Install the newest release in place; `--check` only reports, `--tag` pins a release |
 | `freepi-bridge version`, `--version` | Print the version |
 | `freepi-bridge help`, `--help` | Global help; `<command> --help` for one command |
@@ -179,20 +180,43 @@ Exit code is `0` on success and `1` on error: daemon down, bad flag, failed chec
 
 ### Environment
 
+Every variable here can also live in [the config file](#configuration); the environment wins.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `FREEPI_BASE_URL` | `https://api.freepi.ai` | Upstream API |
 | `FREEPI_TOKEN` | unset | Account JWT; overrides the credentials file |
 | `FREEPI_CREDENTIALS` | `~/.free-pi/agent/credentials.json` | Token file written by the official CLI |
 | `BRIDGE_API_KEY` | unset | Shared key clients must send; also gates `/ads` |
-| `HOST`, `PORT` | `127.0.0.1`, `8787` (`0.0.0.0`, `7860` on a Space) | Listen address |
+| `HOST`, `PORT` | `127.0.0.1`, `8787` | Listen address |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | State and log directory |
 | `FREEPI_BRIDGE_INSECURE` | unset | `1` behaves like `--insecure` |
-| `FREEPI_AUTO_AD` | `0` | `1` on, `0` off; the bridge reports an ad without the ad page |
+| `FREEPI_AUTO_AD` | `1` | `1` on by default, `0` off; the bridge reports an ad without the ad page |
 | `FREEPI_AD_REFRESH_SECS` | `600` | Seconds between automatic ad reports; values under 30 are ignored |
 | `FREEPI_AUTO_UPDATE` | unset | `start --bg` checks once a day: unset prints a notice, `1` installs the update, `0` never checks |
 | `FREEPI_BRIDGE_DOWNLOAD_BASE` | GitHub releases | Mirror base URL for update downloads |
-| `TZ` | system timezone | Sent as `x-client-timezone` on ad requests |
+| `TZ` | `UTC` | Sent as `x-client-timezone` on ad requests |
+
+## Configuration
+
+Settings can live in `~/.freepi-bridge/config.env` (or `$FREEPI_BRIDGE_DIR/config.env`) instead of your shell, so a daemon started by a supervisor, a cron job, or after a reboot keeps them. Both installers create the file, and a plain `start` creates it too, so there is always something to edit. It is written `0600` on Linux and macOS (Windows uses the user's default ACL) because it may hold `FREEPI_TOKEN` or `BRIDGE_API_KEY`.
+
+```ini
+# freepi-bridge configuration
+FREEPI_AUTO_AD=1
+FREEPI_AD_REFRESH_SECS=300
+BRIDGE_API_KEY=
+# PORT=8787
+```
+
+`KEY=VALUE` per line, `#` starts a comment (put a space before it, or quote the value, to keep a `#` inside one), and matching quotes around a value are stripped. Unknown keys are reported on stderr and ignored, so a typo cannot quietly change how the bridge runs. The real environment wins over the file, which keeps one-off overrides working (`FREEPI_AUTO_AD=0 freepi-bridge start --bg`). Edits apply on the next start: `freepi-bridge restart`.
+
+```bash
+freepi-bridge config            # print the path and the current contents
+freepi-bridge config --init     # create it if it is missing; never overwrites
+```
+
+`FREEPI_BRIDGE_DIR` is the one variable the file cannot set, because it decides where the file is read from.
 
 ## Updates
 
@@ -221,9 +245,9 @@ The same command works on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows 1
 
 The bridge looks for a token in this order:
 
-1. `FREEPI_TOKEN`
-2. the credentials file (`FREEPI_CREDENTIALS`, else `~/.free-pi/agent/credentials.json`)
-3. a JWT from the client in `Authorization: Bearer eyJ...`, accepted only when `BRIDGE_API_KEY` is unset
+1. a JWT from the client in `Authorization: Bearer eyJ...`, accepted only when `BRIDGE_API_KEY` is unset
+2. `FREEPI_TOKEN`
+3. the credentials file (`FREEPI_CREDENTIALS`, else `~/.free-pi/agent/credentials.json`)
 
 ## Ads
 
@@ -241,26 +265,24 @@ Keep the page open while you work. Reporting an impression for a creative nobody
 
 ### Headless hosts
 
-`/ads` only listens on the bridge's own port. A container, a Space or a CI runner cannot open it, so the bridge never reports an ad and FreePi answers `403 ads_required`. `FREEPI_AUTO_AD=1` makes the bridge report an ad by itself and retry a gated completion once. `0` or unset leaves the account alone.
+`/ads` only listens on the bridge's own port. A container or a CI runner cannot open it, so the bridge reports an ad by itself and retries a gated completion once, which is what `FREEPI_AUTO_AD` does and why it starts out on. `FREEPI_AUTO_AD=0` leaves the account alone, and such a host then keeps answering `403 ads_required`.
 
-### Turning it on
+### Automatic reports
 
-`FREEPI_AUTO_AD` is read once, when the process starts; nothing is saved to a config file. It has to be in the environment of the command that spawns the daemon.
+The bridge reports an ad by itself every `FREEPI_AD_REFRESH_SECS` seconds, so completions keep working on a container, a CI runner or any host where no browser can open `/ads`. `FREEPI_AUTO_AD` is read once, when the process starts, from the environment or [the config file](#configuration); `0` turns the reports off.
 
 ```bash
 freepi-bridge token          # empty? see Prerequisites
-
-FREEPI_AUTO_AD=1 FREEPI_AD_REFRESH_SECS=300 freepi-bridge start --bg
-
+freepi-bridge start --bg
 freepi-bridge logs | grep 'ad impression'
 # ad impression reported (session ..., gravity false)
 ```
 
-`start --bg` copies its environment into the detached child, so both variables survive. `restart` re-reads them from the shell that runs it, not from the daemon it replaced: `FREEPI_AUTO_AD=1 freepi-bridge restart` keeps reporting, a bare `freepi-bridge restart` turns it off. Export them in `~/.profile` to stop typing them (`export FREEPI_AUTO_AD=1`, `export FREEPI_AD_REFRESH_SECS=300`). Supervisors work the same way: `Environment=FREEPI_AUTO_AD=1` in a systemd unit, `-e FREEPI_AUTO_AD=1` for `docker run`.
+`start --bg` copies its environment into the detached child, so the setting survives. `restart` re-reads the shell and the config file of the command that runs it, not the daemon it replaced, so `FREEPI_AUTO_AD=0 freepi-bridge restart` switches one run to real ad views; put `FREEPI_AUTO_AD=0` in `~/.freepi-bridge/config.env` to make it stick. Supervisors work the same way: `Environment=FREEPI_AUTO_AD=0` in a systemd unit, `-e FREEPI_AUTO_AD=0` for `docker run`.
 
-`freepi-bridge stop` then `start` without the variable turns the reporting off again; `FREEPI_AUTO_AD=0` does the same.
+`freepi-bridge ads` prints the page to open when you would rather see the ad for real.
 
-The flag reports ads the bridge never displayed. Use it only where the ad page is unreachable.
+Automatic reports claim an ad nobody saw, which is impression fraud and can get the account reviewed; set `FREEPI_AUTO_AD=0` on any machine where a browser can keep `/ads` open.
 
 ## Docker
 
@@ -278,7 +300,7 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-The container runs as a non-root user, binds `0.0.0.0:7860`, and ships a `/health` healthcheck. State stays outside the container; the token arrives through `FREEPI_TOKEN`.
+The container runs as a non-root user, binds `0.0.0.0:7860`, and ships a `/health` healthcheck. Binding `0.0.0.0` makes the bridge require `BRIDGE_API_KEY` (or `FREEPI_BRIDGE_INSECURE=1`), so a run without either exits on start. State and `config.env` live inside the container; mount `/home/bridge/.freepi-bridge` if you want them to survive a rebuild. The token arrives through `FREEPI_TOKEN`.
 
 ## Development
 
@@ -289,8 +311,6 @@ PREFIX=/tmp/out ./install.sh     # local build, no release download
 ```
 
 The MSRV is 1.89, set by `uuid` 1.29. CI runs the suite on stable and on 1.89, so the badge cannot drift without a red build.
-
-Tagging cuts a release. `git tag v0.1.0 && git push --tags` runs `release.yml`, which builds static `linux-x86_64` and `linux-aarch64` tarballs, `macos-x86_64` and `macos-aarch64` tarballs, and a `windows-x86_64` zip, each with a `.sha256` beside it.
 
 Measured on an i5-13420H against a local mock upstream at 50 concurrent connections: about 30k req/s, 1.5 ms p50 added per request, 6.8 MB RSS, 2.8 MB binary. Real FreePi completions take seconds, so the proxy hop does not show up in practice.
 
