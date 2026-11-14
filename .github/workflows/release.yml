@@ -34,7 +34,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/freepi-bridge" freepi-bridge
           tar -czf "freepi-bridge-${{ matrix.asset }}.tar.gz" freepi-bridge
           sha256sum "freepi-bridge-${{ matrix.asset }}.tar.gz" > "freepi-bridge-${{ matrix.asset }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: freepi-bridge-${{ matrix.asset }}
           path: |
@@ -67,7 +67,7 @@ jobs:
           tar -czf "freepi-bridge-${{ matrix.asset }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" freepi-bridge
           shasum -a 256 "freepi-bridge-${{ matrix.asset }}.tar.gz" > "freepi-bridge-${{ matrix.asset }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: freepi-bridge-${{ matrix.asset }}
           path: |
@@ -89,7 +89,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 freepi-bridge-windows-x86_64.zip).Hash.ToLower()
           "$hash  freepi-bridge-windows-x86_64.zip" |
             Out-File -Encoding ascii -NoNewline freepi-bridge-windows-x86_64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: freepi-bridge-windows-x86_64
           path: |
