@@ -467,7 +467,7 @@ fn cmd_token() -> i32 {
         }
         None => {
             eprintln!(
-                "no FreePi token in FREEPI_TOKEN or {}; run the free-pi CLI once to sign in",
+                "no FreePi token in FREEPI_TOKEN or {}; run `npx free-pi-cli@latest` once to sign in",
                 credentials_path().display()
             );
             1
@@ -637,7 +637,7 @@ async fn cmd_doctor(flags: Flags) -> i32 {
             fatal: true,
             label: "FreePi token",
             detail: format!(
-                "missing (run the free-pi CLI once, or set FREEPI_TOKEN; checked {})",
+                "missing (set FREEPI_TOKEN, or run `npx free-pi-cli@latest` once; checked {})",
                 credentials_path().display()
             ),
         }),

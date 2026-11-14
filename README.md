@@ -11,6 +11,8 @@ A single Rust binary, no runtime and no extra services.
 
 </div>
 
+Language: English | [Indonesia](README.id.md)
+
 FreePi's API expects its own client. Every completion needs `x-client-version` and `x-session-id` headers, and free completions stay paused until the account has shown an ad (`403 ads_required`). The bridge adds those headers, serves the ad page, and forwards completions to `api.freepi.ai`. Any OpenAI-compatible client works once it points at the bridge.
 
 ```
@@ -19,21 +21,58 @@ client ──/v1/chat/completions──▶ freepi-bridge ──▶ api.freepi.ai
                               /ads (web page)
 ```
 
+## Prerequisites
+
+The bridge has no login of its own. It spends a FreePi account, so it needs that account's JWT: either `FREEPI_TOKEN` in the environment, or the credentials file the official CLI writes to `~/.free-pi/agent/credentials.json`. Without one of the two, `freepi-bridge token` prints nothing and every completion fails with `401`.
+
+The easiest way to get the file is to run the official CLI once. You do not have to keep it or use it as your editor:
+
+```bash
+npx free-pi-cli@latest      # needs Node.js 22.15+; downloads, runs, stores the token
+```
+
+That is a one-off: sign in with GitHub, accept the consent screen, and quit. `~/.free-pi/agent/credentials.json` now holds the token and the bridge reuses it forever. Running `npx free-pi-cli@latest` again later is also how you re-sign in if the token expires.
+
+Install it globally instead if you would rather not download it each time, or if you also want to use it as a coding agent:
+
+```bash
+npm install -g free-pi-cli
+free-pi-cli
+```
+
+On a machine that cannot run Node or a browser (a container, a Space, a CI runner), skip the CLI and pass the JWT directly:
+
+```bash
+FREEPI_TOKEN=eyJ... freepi-bridge start --bg
+```
+
 ## Install
 
-Linux and macOS:
+A prebuilt binary exists for every supported system, so no Rust toolchain is needed. Pick your platform:
+
+| System | Installer | Lands in |
+|---|---|---|
+| Linux x86_64, aarch64 | `install.sh` | `~/.local/bin` |
+| macOS 11+ on arm64, x86_64 | `install.sh` | `~/.local/bin` |
+| WSL2 | `install.sh` (same as Linux) | `~/.local/bin` |
+| Windows 10+ on x86_64 | `install.ps1` | `%LOCALAPPDATA%\Programs\freepi-bridge`, added to the user PATH |
+| Windows on arm64 | `install.ps1` (x64 build, under emulation) | `%LOCALAPPDATA%\Programs\freepi-bridge` |
+| Docker, any host | `docker run`, see [Docker](#docker) | container only |
+| Anything else | `cargo install --path .` from a clone | `~/.cargo/bin` |
+
+Linux, macOS and WSL2:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.sh | sh
 ```
 
-Windows (PowerShell 5.1 or newer):
+Windows, in PowerShell 5.1 or newer:
 
 ```powershell
 irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.ps1 | iex
 ```
 
-Both installers fetch the release binary, check its `.sha256` when the release publishes one, and put it on your PATH. Linux and macOS land in `~/.local/bin`. Windows lands in `%LOCALAPPDATA%\Programs\freepi-bridge` and adds that folder to the user PATH. A Rust toolchain is not needed.
+Both installers fetch the release binary and check its `.sha256` when the release publishes one.
 
 | Flag or variable | Effect |
 |---|---|
@@ -70,7 +109,7 @@ irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.
 
 Both paths leave `~/.free-pi` alone; that directory belongs to the official FreePi CLI.
 
-### Platforms
+### Details per platform
 
 | Platform | What you get |
 |---|---|
@@ -81,7 +120,7 @@ Both paths leave `~/.free-pi` alone; that directory belongs to the official Free
 | WSL2 | use the Linux build |
 | Docker | `debian-bookworm-slim` runtime |
 
-`install.sh` is POSIX `sh`. It reads checksums with `sha256sum` or `shasum -a 256`, and skips verification on machines that have neither. State and log paths follow `HOME`, or `USERPROFILE` on Windows.
+`install.sh` is POSIX `sh`, so it also runs under `dash`, `busybox sh` and `zsh`. It reads checksums with `sha256sum` or `shasum -a 256`, and skips verification on machines that have neither. `install.ps1` needs PowerShell 5.1, which ships with Windows 10. State and log paths follow `HOME`, or `USERPROFILE` on Windows.
 
 ## Quick start
 
@@ -107,7 +146,17 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"particle","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-The bridge reuses the account JWT that the official `free-pi` CLI already stored. Run `free-pi` once in a terminal if `freepi-bridge token` prints nothing.
+On Windows, `curl` is an alias for `Invoke-WebRequest` in PowerShell 5.1, so call `curl.exe` or use the native cmdlet:
+
+```powershell
+$body = '{"model":"particle","messages":[{"role":"user","content":"hi"}]}'
+Invoke-RestMethod http://127.0.0.1:8787/v1/chat/completions `
+  -Method Post -ContentType 'application/json' -Body $body
+```
+
+The bridge reuses the account JWT that the official FreePi CLI already stored in `~/.free-pi/agent/credentials.json`. If `freepi-bridge token` prints nothing, see [Prerequisites](#prerequisites).
+
+If completions answer `403 ads_required` because no browser can reach `/ads` (container, VM, remote box), start the daemon with `FREEPI_AUTO_AD=1` instead. See [Turning it on](#turning-it-on).
 
 ## Commands
 
@@ -177,6 +226,23 @@ Keep the page open while you work. Reporting an impression for a creative nobody
 
 `/ads` only listens on the bridge's own port. A container, a Space or a CI runner cannot open it, so the bridge never reports an ad and FreePi answers `403 ads_required`. `FREEPI_AUTO_AD=1` makes the bridge report an ad by itself and retry a gated completion once. `0` or unset leaves the account alone.
 
+### Turning it on
+
+`FREEPI_AUTO_AD` is read once, when the process starts; nothing is saved to a config file. It has to be in the environment of the command that spawns the daemon.
+
+```bash
+freepi-bridge token          # empty? see Prerequisites
+
+FREEPI_AUTO_AD=1 FREEPI_AD_REFRESH_SECS=300 freepi-bridge start --bg
+
+freepi-bridge logs | grep 'ad impression'
+# ad impression reported (session ..., gravity false)
+```
+
+`start --bg` copies its environment into the detached child, so both variables survive. `restart` re-reads them from the shell that runs it, not from the daemon it replaced: `FREEPI_AUTO_AD=1 freepi-bridge restart` keeps reporting, a bare `freepi-bridge restart` turns it off. Export them in `~/.profile` to stop typing them (`export FREEPI_AUTO_AD=1`, `export FREEPI_AD_REFRESH_SECS=300`). Supervisors work the same way: `Environment=FREEPI_AUTO_AD=1` in a systemd unit, `-e FREEPI_AUTO_AD=1` for `docker run`.
+
+`freepi-bridge stop` then `start` without the variable turns the reporting off again; `FREEPI_AUTO_AD=0` does the same.
+
 The flag reports ads the bridge never displayed. Use it only where the ad page is unreachable.
 
 ## Docker
@@ -213,4 +279,4 @@ Measured on an i5-13420H against a local mock upstream at 50 concurrent connecti
 
 ## License
 
-GPL-3.0-only. See `LICENSE`.
+GPL-3.0-only. See [LICENSE](LICENSE).

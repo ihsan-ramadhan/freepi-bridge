@@ -455,7 +455,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
         let Some(token) = state.token_for(&req) else {
             return Ok(json_error(
                 StatusCode::UNAUTHORIZED,
-                "Missing FreePi token. Run freepi login or set FREEPI_TOKEN.",
+                "Missing FreePi token. Set FREEPI_TOKEN, or run `npx free-pi-cli@latest` once to sign in.",
                 "auth_error",
             ));
         };
