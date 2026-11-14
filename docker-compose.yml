@@ -1,0 +1,12 @@
+services:
+  freepi-bridge:
+    build: .
+    container_name: freepi-bridge
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:7860"
+    environment:
+      - FREEPI_TOKEN=${FREEPI_TOKEN:-}
+      - BRIDGE_API_KEY=${BRIDGE_API_KEY:-}
+      - FREEPI_BASE_URL=${FREEPI_BASE_URL:-https://api.freepi.ai}
+      - TZ=${TZ:-}

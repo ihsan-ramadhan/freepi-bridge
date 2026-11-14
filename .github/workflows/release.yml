@@ -1,0 +1,110 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # run the build matrix by hand to test it before the first tag
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            asset: linux-aarch64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # static musl binaries: no glibc version to match on the target machine
+      - uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --locked --release
+          strip: true
+      - name: package
+        run: |
+          cp "target/${{ matrix.target }}/release/freepi-bridge" freepi-bridge
+          tar -czf "freepi-bridge-${{ matrix.asset }}.tar.gz" freepi-bridge
+          sha256sum "freepi-bridge-${{ matrix.asset }}.tar.gz" > "freepi-bridge-${{ matrix.asset }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freepi-bridge-${{ matrix.asset }}
+          path: |
+            freepi-bridge-${{ matrix.asset }}.tar.gz
+            freepi-bridge-${{ matrix.asset }}.tar.gz.sha256
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 was retired (Dec 2025) and macos-14 is deprecated;
+          # macos-15-intel is the current x86_64 image
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: package
+        run: |
+          tar -czf "freepi-bridge-${{ matrix.asset }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" freepi-bridge
+          shasum -a 256 "freepi-bridge-${{ matrix.asset }}.tar.gz" > "freepi-bridge-${{ matrix.asset }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freepi-bridge-${{ matrix.asset }}
+          path: |
+            freepi-bridge-${{ matrix.asset }}.tar.gz
+            freepi-bridge-${{ matrix.asset }}.tar.gz.sha256
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - name: package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/freepi-bridge.exe `
+            -DestinationPath freepi-bridge-windows-x86_64.zip -Force
+          $hash = (Get-FileHash -Algorithm SHA256 freepi-bridge-windows-x86_64.zip).Hash.ToLower()
+          "$hash  freepi-bridge-windows-x86_64.zip" |
+            Out-File -Encoding ascii -NoNewline freepi-bridge-windows-x86_64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freepi-bridge-windows-x86_64
+          path: |
+            freepi-bridge-windows-x86_64.zip
+            freepi-bridge-windows-x86_64.zip.sha256
+
+  publish:
+    needs: [linux, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

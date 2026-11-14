@@ -1,0 +1,116 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  freepi-bridge installer for Windows.
+
+.DESCRIPTION
+  Downloads the release build, verifies its SHA-256, installs it under
+  %LOCALAPPDATA%\Programs\freepi-bridge, and adds that folder to the user PATH.
+
+.EXAMPLE
+  irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.ps1 | iex
+
+.EXAMPLE
+  .\install.ps1 -Prefix C:\tools\freepi-bridge -Version v0.1.0
+
+.NOTES
+  When piped into iex there are no arguments; use the FREEPI_BRIDGE_PREFIX,
+  FREEPI_BRIDGE_VERSION and FREEPI_BRIDGE_DOWNLOAD_BASE environment variables.
+#>
+param(
+  [string]$Prefix = $(if ($env:FREEPI_BRIDGE_PREFIX) { $env:FREEPI_BRIDGE_PREFIX } else { Join-Path $env:LOCALAPPDATA 'Programs\freepi-bridge' }),
+  [string]$Version = $env:FREEPI_BRIDGE_VERSION,
+  [switch]$FromSource,
+  [switch]$NoPath
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$repo = 'ihsan-ramadhan/freepi-bridge'
+$base = if ($env:FREEPI_BRIDGE_DOWNLOAD_BASE) { $env:FREEPI_BRIDGE_DOWNLOAD_BASE } else { "https://github.com/$repo/releases" }
+$asset = 'freepi-bridge-windows-x86_64.zip'
+$url = if ($Version) { "$base/download/$Version/$asset" } else { "$base/latest/download/$asset" }
+
+function Write-Step([string]$Text) { Write-Host $Text }
+
+function Add-ToUserPath([string]$Directory) {
+  if ($NoPath) { return }
+  $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+  $entries = @()
+  if ($current) { $entries = $current -split ';' | Where-Object { $_ } }
+  if ($entries -notcontains $Directory) {
+    $updated = (@($entries) + $Directory) -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+    Write-Step "added $Directory to the user PATH (open a new shell to pick it up)"
+  }
+  $env:Path = "$Directory;$env:Path"
+}
+
+function Get-Release([string]$TempDir) {
+  $archive = Join-Path $TempDir $asset
+  Write-Step "downloading $asset ..."
+  Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
+
+  $expected = $null
+  try {
+    $checksum = (Invoke-WebRequest -UseBasicParsing -Uri "$url.sha256").Content
+    $expected = ($checksum -split '\s+')[0].ToLower()
+  } catch {
+    Write-Step 'no checksum file published; skipping verification'
+  }
+  if ($expected) {
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLower()
+    if ($actual -ne $expected) { throw "checksum mismatch for $asset" }
+    Write-Step 'checksum verified'
+  }
+
+  Expand-Archive -Path $archive -DestinationPath $TempDir -Force
+  $binary = Join-Path $TempDir 'freepi-bridge.exe'
+  if (-not (Test-Path $binary)) { throw 'release archive has no freepi-bridge.exe' }
+  return $binary
+}
+
+function Build-FromSource([string]$TempDir) {
+  if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    throw 'cargo not found; install Rust from https://rustup.rs or download a release manually'
+  }
+  Write-Step "cloning $repo ..."
+  $source = Join-Path $TempDir 'src'
+  git clone --depth 1 "https://github.com/$repo.git" $source
+  Push-Location $source
+  try {
+    Write-Step 'building release binary ...'
+    cargo build --release --locked
+  } finally {
+    Pop-Location
+  }
+  return (Join-Path $source 'target\release\freepi-bridge.exe')
+}
+
+New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+$temp = Join-Path ([IO.Path]::GetTempPath()) ("freepi-bridge-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $temp | Out-Null
+
+try {
+  $binary = $null
+  if (-not $FromSource) {
+    try {
+      $binary = Get-Release $temp
+    } catch {
+      Write-Step "release install failed: $($_.Exception.Message)"
+      Write-Step 'falling back to a source build'
+    }
+  }
+  if (-not $binary) {
+    $binary = Build-FromSource $temp
+  }
+
+  $destination = Join-Path $Prefix 'freepi-bridge.exe'
+  Copy-Item -Path $binary -Destination $destination -Force
+  Write-Step "installed $destination"
+  Add-ToUserPath $Prefix
+  & $destination --version
+} finally {
+  Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
+}
