@@ -5,7 +5,7 @@
 **An OpenAI-compatible HTTP API for a FreePi account.**<br>
 A single Rust binary, no runtime and no extra services.
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/badge/version-0.1.1-blue)
 ![msrv](https://img.shields.io/badge/msrv-1.89%2B-orange)
 ![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
