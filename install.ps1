@@ -13,15 +13,21 @@
 .EXAMPLE
   .\install.ps1 -Prefix C:\tools\freepi-bridge -Version v0.1.0
 
+.EXAMPLE
+  .\install.ps1 -Uninstall
+
 .NOTES
   When piped into iex there are no arguments; use the FREEPI_BRIDGE_PREFIX,
-  FREEPI_BRIDGE_VERSION and FREEPI_BRIDGE_DOWNLOAD_BASE environment variables.
+  FREEPI_BRIDGE_VERSION, FREEPI_BRIDGE_DOWNLOAD_BASE and
+  FREEPI_BRIDGE_UNINSTALL environment variables.
 #>
 param(
   [string]$Prefix = $(if ($env:FREEPI_BRIDGE_PREFIX) { $env:FREEPI_BRIDGE_PREFIX } else { Join-Path $env:LOCALAPPDATA 'Programs\freepi-bridge' }),
   [string]$Version = $env:FREEPI_BRIDGE_VERSION,
   [switch]$FromSource,
-  [switch]$NoPath
+  [switch]$NoPath,
+  [switch]$Uninstall = [bool]($env:FREEPI_BRIDGE_UNINSTALL -eq '1'),
+  [switch]$KeepState
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +51,55 @@ function Add-ToUserPath([string]$Directory) {
     Write-Step "added $Directory to the user PATH (open a new shell to pick it up)"
   }
   $env:Path = "$Directory;$env:Path"
+}
+
+function Remove-FromUserPath([string]$Directory) {
+  $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $current) { return }
+  $entries = @($current -split ';' | Where-Object { $_ })
+# remove the single entry the installer added; leave any other duplicates alone
+  $removed = $false
+  $kept = foreach ($entry in $entries) {
+    if (-not $removed -and ($entry.TrimEnd('\')) -eq ($Directory.TrimEnd('\'))) {
+      $removed = $true
+      continue
+    }
+    $entry
+  }
+  if (-not $removed) {
+    Write-Step "$Directory was not on the user PATH"
+    return
+  }
+  [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+  Write-Step "removed $Directory from the user PATH"
+}
+
+function Remove-Install([string]$StateDir) {
+  $binary = Join-Path $Prefix 'freepi-bridge.exe'
+  if (Test-Path $binary) {
+    # stop the daemon recorded in state.json before its binary disappears
+    try { & $binary stop | Out-Null } catch { }
+  }
+
+  if (Test-Path $Prefix) {
+    Remove-Item -Recurse -Force $Prefix -ErrorAction SilentlyContinue
+    if (Test-Path $Prefix) { throw "could not remove $Prefix" }
+    Write-Step "removed $Prefix"
+  } else {
+    Write-Step "nothing installed at $Prefix"
+  }
+
+  Remove-FromUserPath $Prefix
+
+  if ($KeepState) {
+    Write-Step "kept $StateDir (-KeepState)"
+    return
+  }
+  if (Test-Path $StateDir) {
+    Remove-Item -Recurse -Force $StateDir -ErrorAction SilentlyContinue
+    if (Test-Path $StateDir) { throw "could not remove $StateDir" }
+    Write-Step "removed $StateDir"
+  }
 }
 
 function Get-Release([string]$TempDir) {
@@ -86,6 +141,13 @@ function Build-FromSource([string]$TempDir) {
     Pop-Location
   }
   return (Join-Path $source 'target\release\freepi-bridge.exe')
+}
+
+if ($Uninstall) {
+  $stateDir = if ($env:FREEPI_BRIDGE_DIR) { $env:FREEPI_BRIDGE_DIR } else { Join-Path $env:USERPROFILE '.freepi-bridge' }
+  Remove-Install $stateDir
+  Write-Step 'freepi-bridge uninstalled; ~/.free-pi (the official CLI) was left alone'
+  return
 }
 
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null

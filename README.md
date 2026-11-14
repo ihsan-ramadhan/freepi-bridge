@@ -6,7 +6,8 @@
 A single Rust binary, no runtime and no extra services.
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![rust](https://img.shields.io/badge/msrv-1.89%2B-orange)
+![msrv](https://img.shields.io/badge/msrv-1.89%2B-orange)
+![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 </div>
 
@@ -45,6 +46,29 @@ Both installers fetch the release binary, check its `.sha256` when the release p
 The PowerShell script takes `-Prefix`, `-Version`, `-FromSource` and `-NoPath`. Piping into `iex` leaves no room for arguments, so the same values come from `FREEPI_BRIDGE_PREFIX`, `FREEPI_BRIDGE_VERSION` and `FREEPI_BRIDGE_DOWNLOAD_BASE`.
 
 Running `./install.sh` from a clone builds locally instead. If no release is reachable, both scripts fall back to `git clone` plus `cargo build --release`. `cargo install --path .` also works.
+
+### Uninstall
+
+Linux and macOS: stop the daemon, delete the binary, delete the state directory.
+
+```bash
+freepi-bridge stop
+rm ~/.local/bin/freepi-bridge
+rm -rf ~/.freepi-bridge
+```
+
+If you installed with `PREFIX=/opt/x` or `--system`, delete the binary from there instead, and if you set `FREEPI_BRIDGE_DIR`, delete that directory instead of `~/.freepi-bridge`.
+
+Windows: the installer also edits your user PATH, so uninstall through the script.
+
+```powershell
+irm https://raw.githubusercontent.com/ihsan-ramadhan/freepi-bridge/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -Uninstall
+```
+
+`-Uninstall` stops the daemon, deletes `%LOCALAPPDATA%\Programs\freepi-bridge`, removes that folder from the user PATH, and deletes `%USERPROFILE%\.freepi-bridge`. Add `-KeepState` to keep the state directory and its log, and `-Prefix <dir>` if you installed somewhere else. Piped usage works too: set `$env:FREEPI_BRIDGE_UNINSTALL='1'` before `irm … | iex`.
+
+Both paths leave `~/.free-pi` alone; that directory belongs to the official FreePi CLI.
 
 ### Platforms
 
@@ -165,15 +189,6 @@ docker compose logs -f
 
 The container runs as a non-root user, binds `0.0.0.0:7860`, and ships a `/health` healthcheck. State stays outside the container; the token arrives through `FREEPI_TOKEN`.
 
-## HuggingFace Space
-
-Push this repository as a Docker Space, then add two secrets under Settings, Variables and secrets:
-
-- `FREEPI_TOKEN`: the account JWT, printed by `freepi-bridge token`
-- `BRIDGE_API_KEY`: the key your clients send
-
-The bridge notices `SPACE_ID` and listens on `0.0.0.0:7860`. It refuses to start on a public bind without `BRIDGE_API_KEY`, so a Space cannot expose the account by accident. Clients then use `https://<user>-<space>.hf.space/v1`.
-
 ## Development
 
 ```bash
@@ -190,4 +205,4 @@ Measured on an i5-13420H against a local mock upstream at 50 concurrent connecti
 
 ## License
 
-There is no license file yet. Pick one (MIT or Apache-2.0 are the usual choices) before publishing.
+GPL-3.0-only. See `LICENSE`.
