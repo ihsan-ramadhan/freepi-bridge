@@ -1,6 +1,7 @@
 mod bridge;
 mod cli;
 mod state;
+mod update;
 
 #[tokio::main]
 async fn main() {

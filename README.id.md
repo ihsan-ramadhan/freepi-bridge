@@ -171,6 +171,7 @@ Kalau completion menjawab `403 ads_required` karena tidak ada browser yang bisa 
 | `freepi-bridge logs [-f]` | Cetak 200 baris log terakhir; `-f` mengikuti |
 | `freepi-bridge token` | Cetak JWT yang dipakai bridge |
 | `freepi-bridge ads` | Cetak URL halaman iklan, beserta key kalau ada |
+| `freepi-bridge update [--check] [--tag TAG]` | Pasang rilis terbaru di tempat; `--check` hanya melapor, `--tag` mengunci satu rilis |
 | `freepi-bridge version`, `--version` | Cetak versi |
 | `freepi-bridge help`, `--help` | Bantuan global; `<perintah> --help` untuk satu perintah |
 
@@ -189,7 +190,23 @@ Exit code `0` kalau berhasil dan `1` kalau gagal: daemon mati, flag salah, pemer
 | `FREEPI_BRIDGE_INSECURE` | tidak disetel | `1` berperilaku seperti `--insecure` |
 | `FREEPI_AUTO_AD` | `0` | `1` nyala, `0` mati; bridge melaporkan iklan tanpa halaman iklan |
 | `FREEPI_AD_REFRESH_SECS` | `600` | Jeda antar laporan iklan otomatis; nilai di bawah 30 diabaikan |
+| `FREEPI_AUTO_UPDATE` | tidak disetel | `start --bg` memeriksa sekali sehari: tidak disetel = cetak pemberitahuan, `1` = pasang otomatis, `0` = tidak pernah memeriksa |
+| `FREEPI_BRIDGE_DOWNLOAD_BASE` | rilis GitHub | URL mirror untuk unduhan update |
 | `TZ` | zona waktu sistem | Dikirim sebagai `x-client-timezone` pada permintaan iklan |
+
+## Update
+
+`freepi-bridge update` menukar binary yang sedang dipakai dengan rilis terbaru: ia membaca `releases/latest` di GitHub, mengunduh aset untuk platform ini, mencocokkan `.sha256` yang diterbitkan, mengganti binary, lalu menyalakan ulang daemon kalau sebelumnya berjalan.
+
+```bash
+freepi-bridge update                # pasang rilis terbaru
+freepi-bridge update --check        # hanya melapor apakah ada versi baru
+freepi-bridge update --tag v0.1.2   # pasang rilis tertentu, atau turun versi
+```
+
+Perintah yang sama jalan di Linux x86_64/aarch64, macOS arm64/x86_64 dan Windows 10+ x86_64. Ia hanya menulis di sebelah binary, jadi pemasangan yang butuh root (`/usr/local/bin`) harus diperbarui dengan `sudo`. Unduhan gagal atau checksum tidak cocok tidak menyentuh binary yang sedang dipakai. Di Windows, image yang berjalan diganti nama jadi `freepi-bridge.exe.old` dan dihapus saat start berikutnya.
+
+`start --bg`, dan otomatis juga `restart`, memeriksa paling banyak sekali sehari (stempelnya disimpan di direktori state) lalu mencetak satu baris kalau ada rilis lebih baru. `FREEPI_AUTO_UPDATE=1` memasangnya sebelum daemon jalan; `FREEPI_AUTO_UPDATE=0` tidak pernah memeriksa. `start` di foreground, yang dipakai Docker dan process supervisor, tidak pernah memperbarui diri: bangun image baru atau jalankan ulang installer di sana.
 
 ## Endpoint
 

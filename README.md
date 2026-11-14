@@ -171,6 +171,7 @@ If completions answer `403 ads_required` because no browser can reach `/ads` (co
 | `freepi-bridge logs [-f]` | Print the last 200 log lines; `-f` follows |
 | `freepi-bridge token` | Print the JWT the bridge uses |
 | `freepi-bridge ads` | Print the ad page URL, with the key when one is set |
+| `freepi-bridge update [--check] [--tag TAG]` | Install the newest release in place; `--check` only reports, `--tag` pins a release |
 | `freepi-bridge version`, `--version` | Print the version |
 | `freepi-bridge help`, `--help` | Global help; `<command> --help` for one command |
 
@@ -189,7 +190,23 @@ Exit code is `0` on success and `1` on error: daemon down, bad flag, failed chec
 | `FREEPI_BRIDGE_INSECURE` | unset | `1` behaves like `--insecure` |
 | `FREEPI_AUTO_AD` | `0` | `1` on, `0` off; the bridge reports an ad without the ad page |
 | `FREEPI_AD_REFRESH_SECS` | `600` | Seconds between automatic ad reports; values under 30 are ignored |
+| `FREEPI_AUTO_UPDATE` | unset | `start --bg` checks once a day: unset prints a notice, `1` installs the update, `0` never checks |
+| `FREEPI_BRIDGE_DOWNLOAD_BASE` | GitHub releases | Mirror base URL for update downloads |
 | `TZ` | system timezone | Sent as `x-client-timezone` on ad requests |
+
+## Updates
+
+`freepi-bridge update` replaces the running binary with the newest release: it reads `releases/latest` from GitHub, downloads the asset built for this platform, checks the published `.sha256`, swaps the binary, and restarts the daemon if one was running.
+
+```bash
+freepi-bridge update                # install the latest release
+freepi-bridge update --check        # only say whether a newer one exists
+freepi-bridge update --tag v0.1.2   # install a specific release, or roll back
+```
+
+The same command works on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows 10+ x86_64. It only writes next to the binary, so an install that needed root (`/usr/local/bin`) has to be updated with `sudo`. A failed download or a checksum mismatch leaves the current binary untouched. On Windows the running image is renamed to `freepi-bridge.exe.old` and removed on the next start.
+
+`start --bg`, and therefore `restart`, checks at most once a day (the stamp lives in the state directory) and prints one line when a newer release exists. `FREEPI_AUTO_UPDATE=1` installs it before the daemon starts; `FREEPI_AUTO_UPDATE=0` never checks. A foreground `start`, which is what Docker and process supervisors run, never self-updates: build a new image or re-run the installer there.
 
 ## Endpoints
 

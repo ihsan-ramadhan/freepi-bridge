@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,6 +13,7 @@ use crate::state::{
     clear_state, force_kill, home_dir, is_loopback, log_path, pid_alive, read_state, state_dir,
     terminate, write_state, DEFAULT_PORT, SPACE_PORT,
 };
+use crate::update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -24,6 +25,8 @@ struct Flags {
     json: bool,
     insecure: bool,
     follow: bool,
+    check: bool,
+    tag: Option<String>,
     positionals: Vec<String>,
 }
 
@@ -44,6 +47,7 @@ Commands:
   logs        print the bridge log (-f to follow)
   token       print the FreePi JWT the bridge uses
   ads         print the ad page URL
+  update      install the latest release (--check = report only)
   version     print the version
 
 Flags:
@@ -52,6 +56,8 @@ Flags:
   --bg              detach after starting
   --json            machine-readable output (status, models, doctor)
   --insecure        allow a non-loopback bind without BRIDGE_API_KEY
+  --check           only report whether a newer release exists (update)
+  --tag TAG         install a specific release (update, e.g. v0.1.2)
   -f, --follow      follow the log
   -h, --help        this help; \"freepi-bridge <command> --help\" per command
   -V, --version     print the version
@@ -63,6 +69,8 @@ Environment:
   BRIDGE_API_KEY        shared key clients must send
   HOST / PORT           listen address and port
   FREEPI_BRIDGE_DIR     state and log directory (default ~/.freepi-bridge)
+  FREEPI_AUTO_UPDATE    update check on \"start --bg\"; 1 installs, 0 never checks
+  FREEPI_BRIDGE_DOWNLOAD_BASE  mirror for release downloads
   TZ                    timezone sent with ad requests
 
 Defaults:
@@ -85,6 +93,7 @@ fn command_help(command: &str) -> bool {
         "logs" => "freepi-bridge logs [-f]",
         "token" => "freepi-bridge token",
         "ads" => "freepi-bridge ads",
+        "update" => "freepi-bridge update [--check] [--tag vX.Y.Z]",
         "version" => "freepi-bridge version",
         _ => return false,
     };
@@ -102,6 +111,12 @@ fn parse(argv: Vec<String>) -> Result<Flags, String> {
             "--json" => flags.json = true,
             "--insecure" => flags.insecure = true,
             "--follow" | "-f" => flags.follow = true,
+            "--check" => flags.check = true,
+            "--tag" => {
+                index += 1;
+                let value = argv.get(index).ok_or("--tag needs a release tag, e.g. v0.1.2")?;
+                flags.tag = Some(value.clone());
+            }
             "--port" => {
                 index += 1;
                 let value = argv.get(index).ok_or("--port needs a value")?;
@@ -254,20 +269,34 @@ async fn fetch_catalog() -> Result<(String, Vec<(String, String)>), String> {
     Ok((version, models))
 }
 
+fn guard_bind(host: &str, insecure: bool) -> bool {
+    if is_loopback(host) || insecure || env_nonempty("BRIDGE_API_KEY").is_some() {
+        return true;
+    }
+    eprintln!("refusing to bind {host} without BRIDGE_API_KEY: anyone on the network could spend your account");
+    eprintln!("set BRIDGE_API_KEY, bind 127.0.0.1, or pass --insecure");
+    false
+}
+
 async fn cmd_start(flags: Flags) -> i32 {
     let host = flags.bind.clone().unwrap_or_else(default_host);
     let port = flags.port.unwrap_or_else(default_port);
-    let key = env_nonempty("BRIDGE_API_KEY");
     let insecure = flags.insecure || env_nonempty("FREEPI_BRIDGE_INSECURE").as_deref() == Some("1");
 
-    if !is_loopback(&host) && key.is_none() && !insecure {
-        eprintln!("refusing to bind {host} without BRIDGE_API_KEY: anyone on the network could spend your account");
-        eprintln!("set BRIDGE_API_KEY, bind 127.0.0.1, or pass --insecure");
+    if !guard_bind(&host, insecure) {
         return 1;
     }
 
     if flags.bg {
-        return spawn_detached(&host, port).await;
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                eprintln!("cannot locate the executable: {err}");
+                return 1;
+            }
+        };
+        auto_update().await;
+        return spawn_detached(&exe, &host, port).await;
     }
 
     let normalized = if host.contains(':') && !host.starts_with('[') {
@@ -291,7 +320,7 @@ async fn cmd_start(flags: Flags) -> i32 {
     }
 }
 
-async fn spawn_detached(host: &str, port: u16) -> i32 {
+async fn spawn_detached(exe: &Path, host: &str, port: u16) -> i32 {
     if let Some(state) = read_state() {
         if pid_alive(state.pid) {
             println!(
@@ -315,14 +344,6 @@ async fn spawn_detached(host: &str, port: u16) -> i32 {
             return 1;
         }
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            eprintln!("cannot locate the executable: {err}");
-            return 1;
-        }
-    };
-
     let mut command = Command::new(exe);
     command
         .arg("start")
@@ -556,7 +577,130 @@ async fn cmd_restart(flags: Flags) -> i32 {
     cmd_start(start_flags).await
 }
 
-// ---------------------------------------------------------------- doctor
+async fn auto_update() {
+    let mode = update::auto_mode();
+    if mode == update::AutoUpdate::Off || !update::check_due() {
+        return;
+    }
+    update::mark_checked();
+    let Ok(release) = update::latest_release().await else {
+        return;
+    };
+    if !update::is_newer(VERSION, &release.version) {
+        return;
+    }
+
+    match mode {
+        update::AutoUpdate::Notify => println!(
+            "freepi-bridge {} is available (running {VERSION}); run \"freepi-bridge update\"",
+            release.tag
+        ),
+        update::AutoUpdate::Apply => {
+            println!("updating freepi-bridge {VERSION} -> {} ...", release.version);
+            match update::install(&release).await {
+                Ok(exe) => {
+                    println!("updated {} to {}", exe.display(), release.version);
+                    restart_if_running(&exe).await;
+                }
+                Err(err) => eprintln!("auto update failed: {err} (still running {VERSION})"),
+            }
+        }
+        update::AutoUpdate::Off => {}
+    }
+}
+
+async fn restart_if_running(exe: &Path) {
+    let Some(state) = read_state() else {
+        return;
+    };
+    if !pid_alive(state.pid) {
+        return;
+    }
+    let insecure = env_nonempty("FREEPI_BRIDGE_INSECURE").as_deref() == Some("1");
+    if !guard_bind(&state.host, insecure) {
+        println!("daemon left stopped; start it yourself once the bind is allowed");
+        return;
+    }
+    if stop_daemon() != 0 {
+        return;
+    }
+    if spawn_detached(exe, &state.host, state.port).await == 0 {
+        println!("daemon restarted on the new build");
+    }
+}
+
+async fn cmd_update(flags: Flags) -> i32 {
+    let release = match flags.tag.as_deref() {
+        Some(tag) => {
+            let tag = if tag.starts_with('v') || tag.starts_with('V') {
+                tag.to_string()
+            } else {
+                format!("v{tag}")
+            };
+            if !update::valid_tag(&tag) {
+                eprintln!("invalid release tag: {tag}");
+                return 1;
+            }
+            let asset = match update::platform_asset() {
+                Ok(asset) => asset,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return 1;
+                }
+            };
+            update::Release {
+                version: update::normalize_tag(&tag),
+                tag,
+                asset,
+            }
+        }
+        None => match update::latest_release().await {
+            Ok(release) => release,
+            Err(err) => {
+                eprintln!("cannot check for updates: {err}");
+                return 1;
+            }
+        },
+    };
+
+    let newer = update::is_newer(VERSION, &release.version);
+    if flags.check {
+        if newer {
+            println!("freepi-bridge {} is available (running {VERSION})", release.tag);
+        } else if flags.tag.is_some() {
+            println!("running freepi-bridge {VERSION}, requested {}", release.tag);
+        } else {
+            println!("freepi-bridge {VERSION} is up to date (latest {})", release.tag);
+        }
+        return 0;
+    }
+    if flags.tag.is_none() && !newer {
+        println!("freepi-bridge {VERSION} is up to date (latest {})", release.tag);
+        return 0;
+    }
+    if flags.tag.is_some() && release.version == VERSION {
+        println!("freepi-bridge {VERSION} is already installed");
+        return 0;
+    }
+
+    println!("downloading {} ...", release.asset);
+    match update::install(&release).await {
+        Ok(exe) => {
+            println!(
+                "updated {} to {} ({})",
+                exe.display(),
+                release.version,
+                release.tag
+            );
+            restart_if_running(&exe).await;
+            0
+        }
+        Err(err) => {
+            eprintln!("update failed: {err}");
+            1
+        }
+    }
+}
 
 fn b64url_decode(input: &str) -> Option<Vec<u8>> {
     let mut accumulator: u32 = 0;
@@ -736,6 +880,8 @@ async fn cmd_doctor(flags: Flags) -> i32 {
 }
 
 pub(crate) async fn run(argv: Vec<String>) -> i32 {
+    update::cleanup_stale();
+
     let Some(command) = argv.first().cloned() else {
         help();
         return 0;
@@ -779,6 +925,7 @@ pub(crate) async fn run(argv: Vec<String>) -> i32 {
         "logs" => cmd_logs(flags),
         "token" => cmd_token(),
         "ads" => cmd_ads(flags),
+        "update" => cmd_update(flags).await,
         other => {
             eprintln!("freepi-bridge: unknown command \"{other}\" (try \"freepi-bridge help\")");
             1
