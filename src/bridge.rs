@@ -26,6 +26,8 @@ struct Config {
     token: Option<String>,
     bridge_key: Option<String>,
     credentials: PathBuf,
+    auto_ad: bool,
+    ad_refresh: Duration,
 }
 
 struct Meta {
@@ -39,6 +41,7 @@ pub(crate) struct State {
     http: reqwest::Client,
     meta: Mutex<Option<Meta>>,
     session: String,
+    ad: Mutex<Option<Instant>>,
 }
 
 fn full(bytes: Bytes) -> ResBody {
@@ -159,6 +162,85 @@ impl State {
             return (cached.version.clone(), cached.models.clone());
         }
         (FALLBACK_VERSION.to_string(), Vec::new())
+    }
+
+    async fn report_ad(&self, token: &str, session: &str) -> bool {
+        let (version, _) = self.meta(Some(token)).await;
+        let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
+        let request = self
+            .http
+            .get(format!("{}/ads/next?slot=banner", self.cfg.base_url))
+            .bearer_auth(token)
+            .header("x-session-id", session)
+            .header("x-turn-id", uuid::Uuid::new_v4().to_string())
+            .header("x-client-version", version)
+            .header("x-client-os", std::env::consts::OS)
+            .header("x-client-arch", std::env::consts::ARCH)
+            .header("x-client-timezone", timezone)
+            .header("x-client-locale", "en-US")
+            .timeout(Duration::from_secs(5));
+        let Ok(res) = request.send().await else {
+            return false;
+        };
+        if !res.status().is_success() {
+            return false;
+        }
+        let Ok(ad) = res.json::<Value>().await else {
+            return false;
+        };
+        let (Some(ad_id), Some(click_token)) = (
+            ad.get("ad_id").and_then(Value::as_str),
+            ad.get("click_token").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+
+        let gravity = ad.get("source").and_then(Value::as_str) == Some("gravity");
+        let pixel = gravity
+            .then(|| ad.get("imp_url").and_then(Value::as_str))
+            .flatten();
+        if let Some(imp_url) = pixel {
+            let _ = self
+                .http
+                .get(imp_url)
+                .header(header::USER_AGENT, "Mozilla/5.0 (compatible; freepi-bridge)")
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await;
+        }
+
+        let payload = json!({
+            "ad_id": ad_id,
+            "click_token": click_token,
+            "imp_fired": pixel.is_some(),
+        });
+        let ok = self
+            .http
+            .post(format!("{}/ads/impression", self.cfg.base_url))
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-session-id", session)
+            .timeout(Duration::from_secs(5))
+            .json(&payload)
+            .send()
+            .await
+            .map(|res| res.status().is_success())
+            .unwrap_or(false);
+        println!(
+            "ad impression {} (session {session}, gravity {})",
+            if ok { "reported" } else { "failed" },
+            pixel.is_some()
+        );
+        ok
+    }
+
+    async fn report_ad_throttled(&self, token: &str, session: &str, min_gap: Duration) -> bool {
+        let mut last = self.ad.lock().await;
+        if last.is_some_and(|at| at.elapsed() < min_gap) {
+            return true;
+        }
+        *last = Some(Instant::now());
+        self.report_ad(token, session).await
     }
 }
 
@@ -281,6 +363,49 @@ async fn passthrough(upstream: reqwest::Response) -> Result<Response<ResBody>, B
     Ok(builder.body(full(bytes))?)
 }
 
+fn response_headers(headers: &reqwest::header::HeaderMap) -> (Option<String>, Option<String>) {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let retry_after = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    (content_type, retry_after)
+}
+
+fn buffered_response(status: StatusCode, headers: &reqwest::header::HeaderMap, bytes: Bytes) -> Response<ResBody> {
+    let (content_type, retry_after) = response_headers(headers);
+    let mut builder = Response::builder().status(status);
+    if let Some(value) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, value);
+    }
+    builder.body(full(bytes)).expect("response")
+}
+
+fn streaming_response(upstream: reqwest::Response) -> Response<ResBody> {
+    let status = upstream.status();
+    let (content_type, retry_after) = response_headers(upstream.headers());
+    let mut builder = Response::builder().status(status);
+    if let Some(value) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, value);
+    }
+    let stream = upstream
+        .bytes_stream()
+        .map_ok(http_body::Frame::data)
+        .map_err(|err| Box::new(err) as BoxError);
+    builder
+        .body(BoxBody::new(StreamBody::new(stream)))
+        .expect("response")
+}
+
 async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<ResBody>, BoxError> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -341,41 +466,34 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
         let (version, _) = state.meta(Some(&token)).await;
         let body = req.into_body().collect().await?.to_bytes();
 
-        let upstream = state
-            .http
-            .post(format!("{}/v1/chat/completions", state.cfg.base_url))
-            .bearer_auth(&token)
-            .header(header::CONTENT_TYPE, content_type)
-            .header("x-client-version", version)
-            .header("x-session-id", session)
-            .body(body)
-            .send()
-            .await?;
+        let send = |body: Bytes| {
+            state
+                .http
+                .post(format!("{}/v1/chat/completions", state.cfg.base_url))
+                .bearer_auth(&token)
+                .header(header::CONTENT_TYPE, content_type.as_str())
+                .header("x-client-version", version.as_str())
+                .header("x-session-id", session.as_str())
+                .body(body)
+                .send()
+        };
 
-        let status = upstream.status();
-        let content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let retry_after = upstream
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let mut upstream = send(body.clone()).await?;
 
-        let mut builder = Response::builder().status(status);
-        if let Some(value) = content_type {
-            builder = builder.header(header::CONTENT_TYPE, value);
+        if upstream.status() == StatusCode::FORBIDDEN && state.cfg.auto_ad {
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            let bytes = upstream.bytes().await?;
+            if !String::from_utf8_lossy(&bytes).contains("ads_required") {
+                return Ok(buffered_response(status, &headers, bytes));
+            }
+            state
+                .report_ad_throttled(&token, &session, Duration::from_secs(10))
+                .await;
+            upstream = send(body).await?;
         }
-        if let Some(value) = retry_after {
-            builder = builder.header(header::RETRY_AFTER, value);
-        }
-        let stream = upstream
-            .bytes_stream()
-            .map_ok(http_body::Frame::data)
-            .map_err(|err| Box::new(err) as BoxError);
-        return Ok(builder.body(BoxBody::new(StreamBody::new(stream)))?);
+
+        return Ok(streaming_response(upstream));
     }
 
     if method == Method::GET && path == "/ads/next" {
@@ -459,6 +577,12 @@ pub(crate) fn build_state() -> State {
         token: env_nonempty("FREEPI_TOKEN"),
         bridge_key: env_nonempty("BRIDGE_API_KEY"),
         credentials: credentials_path(),
+        auto_ad: matches!(env_nonempty("FREEPI_AUTO_AD").as_deref(), Some("1") | Some("true")),
+        ad_refresh: env_nonempty("FREEPI_AD_REFRESH_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs >= 30)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(600)),
     };
 
     ensure_crypto_provider();
@@ -471,6 +595,7 @@ pub(crate) fn build_state() -> State {
         cfg,
         meta: Mutex::new(None),
         session: uuid::Uuid::new_v4().to_string(),
+        ad: Mutex::new(None),
     }
 }
 
@@ -485,6 +610,21 @@ pub(crate) fn ensure_crypto_provider() {
 }
 
 pub(crate) async fn serve(state: Arc<State>, addr: SocketAddr) -> std::io::Result<()> {
+    if state.cfg.auto_ad {
+        let keeper = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                if let Some(token) = keeper.token() {
+                    keeper
+                        .report_ad_throttled(&token, &keeper.session, keeper.cfg.ad_refresh)
+                        .await;
+                }
+                tokio::time::sleep(keeper.cfg.ad_refresh).await;
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("freepi-bridge listening on http://{addr}");
     loop {
@@ -513,6 +653,7 @@ mod tests {
     #[derive(Default)]
     struct Captured {
         requests: StdMutex<Vec<(String, String, String, String, String)>>,
+        gate: std::sync::atomic::AtomicBool,
     }
 
     async fn mock_upstream(state: Arc<Captured>, addr: SocketAddr) {
@@ -543,7 +684,16 @@ mod tests {
                                 "models": [{ "id": "mock-a" }, { "id": "mock-b" }],
                             })),
                             "/v1/chat/completions" => {
-                                if String::from_utf8_lossy(&body).contains("\"stream\":true") {
+                                let gated = state.gate.load(std::sync::atomic::Ordering::SeqCst)
+                                    && !state
+                                        .requests
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .any(|(path, _, _, _, _)| path == "/ads/impression");
+                                if gated {
+                                    json_error(StatusCode::FORBIDDEN, "ads_required", "free_pi_error")
+                                } else if String::from_utf8_lossy(&body).contains("\"stream\":true") {
                                     Response::builder()
                                         .header(header::CONTENT_TYPE, "text/event-stream")
                                         .body(full(Bytes::from_static(
@@ -575,6 +725,10 @@ mod tests {
     }
 
     async fn spawn_bridge_with(bridge_key: Option<&str>) -> (String, Arc<Captured>) {
+        spawn_bridge_opts(bridge_key, false).await
+    }
+
+    async fn spawn_bridge_opts(bridge_key: Option<&str>, auto_ad: bool) -> (String, Arc<Captured>) {
         let captured = Arc::new(Captured::default());
         let upstream_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = tokio::net::TcpListener::bind(upstream_addr).await.unwrap();
@@ -590,10 +744,13 @@ mod tests {
                 token: Some("eyJ-upstream".to_string()),
                 bridge_key: bridge_key.map(str::to_string),
                 credentials: PathBuf::from("/nonexistent"),
+                auto_ad,
+                ad_refresh: Duration::from_secs(600),
             },
             http: test_client(),
             meta: Mutex::new(None),
             session: "session-fixed".to_string(),
+            ad: Mutex::new(None),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -761,5 +918,40 @@ mod tests {
             .find(|(path, _, _, _, _)| path == "/v1/chat/completions")
             .expect("chat request reached upstream");
         assert_eq!(call.1, "Bearer eyJclient-token");
+    }
+
+    #[tokio::test]
+    async fn ads_required_is_retried_after_report() {
+        let (base, captured) = spawn_bridge_opts(Some("bridge-secret"), true).await;
+        captured.gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = test_client();
+
+        let chat = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200);
+
+        let paths: Vec<String> = captured
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.0.clone())
+            .collect();
+        let ad_at = paths.iter().position(|path| path == "/ads/next").expect("ad requested");
+        let impression_at = paths
+            .iter()
+            .position(|path| path == "/ads/impression")
+            .expect("impression posted");
+        assert!(ad_at < impression_at, "impression must follow the ad request");
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
+            2,
+            "gated completion is retried once"
+        );
     }
 }

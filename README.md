@@ -138,6 +138,8 @@ Exit code is `0` on success and `1` on error: daemon down, bad flag, failed chec
 | `HOST`, `PORT` | `127.0.0.1`, `8787` (`0.0.0.0`, `7860` on a Space) | Listen address |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | State and log directory |
 | `FREEPI_BRIDGE_INSECURE` | unset | `1` behaves like `--insecure` |
+| `FREEPI_AUTO_AD` | `0` | `1` on, `0` off; the bridge reports an ad without the ad page |
+| `FREEPI_AD_REFRESH_SECS` | `600` | Seconds between automatic ad reports; values under 30 are ignored |
 | `TZ` | system timezone | Sent as `x-client-timezone` on ad requests |
 
 ## Endpoints
@@ -169,7 +171,13 @@ FreePi is ad-funded. An account with no recent impression gets `403 ads_required
 freepi-bridge ads     # prints the URL to open
 ```
 
-Keep the page open while you work. Report an impression only when the creative is actually on screen; reporting a hidden ad is impression fraud and can get the account reviewed. Credits bought on the account remove the requirement.
+Keep the page open while you work. Reporting an impression for a creative nobody saw is impression fraud and can get the account reviewed. Credits bought on the account remove the requirement.
+
+### Headless hosts
+
+`/ads` only listens on the bridge's own port. A container, a Space or a CI runner cannot open it, so the bridge never reports an ad and FreePi answers `403 ads_required`. `FREEPI_AUTO_AD=1` makes the bridge report an ad by itself and retry a gated completion once. `0` or unset leaves the account alone.
+
+The flag reports ads the bridge never displayed. Use it only where the ad page is unreachable.
 
 ## Docker
 
