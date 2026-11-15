@@ -158,7 +158,7 @@ Atur variabel lewat environment atau `~/.freepi-bridge/config.env`
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | alamat listen |
 | `FREEPI_AUTO_AD` | `1` | lapor iklan otomatis, `0` untuk mematikan |
 | `FREEPI_AD_REFRESH_SECS` | `600` | jeda antar laporan dalam detik (min 30) |
-| `FREEPI_AUTO_UPDATE` | tidak diatur | `1` instal update otomatis, `0` tidak pernah cek |
+| `FREEPI_AUTO_UPDATE` | tidak diatur | `start --bg` dan `restart` memeriksa paling banyak sekali sehari: tidak diatur = cetak pemberitahuan, `1` = pasang rilisnya, `0` = tidak pernah memeriksa. Daemon yang sedang berjalan tidak pernah memeriksa sendiri |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | direktori state dan log |
 
 Bind ke alamat non-loopback (`--bind 0.0.0.0`) mewajibkan `BRIDGE_API_KEY`

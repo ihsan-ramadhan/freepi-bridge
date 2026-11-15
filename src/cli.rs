@@ -255,7 +255,11 @@ async fn fetch_catalog() -> Result<(String, Vec<(String, String)>), String> {
         .or_else(|| payload.get("min").and_then(Value::as_str))
         .unwrap_or("unknown")
         .to_string();
-    let models = payload
+    Ok((version, catalog_models(&payload)))
+}
+
+fn catalog_models(payload: &Value) -> Vec<(String, String)> {
+    payload
         .get("models")
         .and_then(Value::as_array)
         .map(|entries| {
@@ -264,16 +268,15 @@ async fn fetch_catalog() -> Result<(String, Vec<(String, String)>), String> {
                 .filter_map(|entry| {
                     let id = entry.get("id")?.as_str()?;
                     let name = entry
-                        .get("display_name")
+                        .get("name")
                         .and_then(Value::as_str)
-                        .or_else(|| entry.get("name").and_then(Value::as_str))
+                        .or_else(|| entry.get("display_name").and_then(Value::as_str))
                         .unwrap_or(id);
                     Some((id.to_string(), name.to_string()))
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    Ok((version, models))
+        .unwrap_or_default()
 }
 
 fn guard_bind(host: &str, insecure: bool) -> bool {
@@ -629,10 +632,10 @@ async fn auto_update() {
     if mode == update::AutoUpdate::Off || !update::check_due() {
         return;
     }
-    update::mark_checked();
     let Ok(release) = update::latest_release().await else {
         return;
     };
+    update::mark_checked();
     if !update::is_newer(VERSION, &release.version) {
         return;
     }
@@ -1007,5 +1010,24 @@ mod tests {
             .expect("valid flags");
         assert_eq!(flags.port, Some(9000));
         assert!(flags.bg);
+    }
+
+    #[test]
+    fn catalog_keeps_the_marker_that_says_whether_a_model_is_free() {
+        let payload = json!({
+            "models": [
+                { "id": "particle", "name": "Particle · Free Unlimited", "display_name": "Particle" },
+                { "id": "solar-pro-4", "name": "Solar Pro 4 · ~0.6x usage", "display_name": "Solar Pro 4" },
+                { "id": "bare" }
+            ]
+        });
+        assert_eq!(
+            catalog_models(&payload),
+            vec![
+                ("particle".to_string(), "Particle · Free Unlimited".to_string()),
+                ("solar-pro-4".to_string(), "Solar Pro 4 · ~0.6x usage".to_string()),
+                ("bare".to_string(), "bare".to_string()),
+            ]
+        );
     }
 }

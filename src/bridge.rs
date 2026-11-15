@@ -18,7 +18,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResBody = BoxBody<Bytes, BoxError>;
 
 const META_TTL: Duration = Duration::from_secs(300);
-const FALLBACK_VERSION: &str = "0.6.20";
+const FALLBACK_VERSION: &str = "0.6.21";
 const DEFAULT_BASE_URL: &str = "https://api.freepi.ai";
 
 struct Config {

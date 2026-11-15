@@ -156,7 +156,7 @@ after editing.
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | listen address |
 | `FREEPI_AUTO_AD` | `1` | auto-report ads, `0` to disable |
 | `FREEPI_AD_REFRESH_SECS` | `600` | seconds between reports (min 30) |
-| `FREEPI_AUTO_UPDATE` | unset | `1` auto-install updates, `0` never check |
+| `FREEPI_AUTO_UPDATE` | unset | `start --bg` and `restart` check at most once a day: unset prints a notice, `1` installs the release, `0` never checks. A running daemon is never checked by itself |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | state and log directory |
 
 Binding to a non-loopback address (`--bind 0.0.0.0`) requires `BRIDGE_API_KEY`
