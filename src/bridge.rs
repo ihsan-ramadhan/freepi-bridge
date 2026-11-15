@@ -242,6 +242,17 @@ impl State {
         *last = Some(Instant::now());
         self.report_ad(token, session).await
     }
+
+    async fn reset_session(&self, token: &str) -> bool {
+        self.http
+            .post(format!("{}/session/reset", self.cfg.base_url))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map(|res| res.status().is_success())
+            .unwrap_or(false)
+    }
 }
 
 const AD_PAGE: &str = r#"<!doctype html>
@@ -466,7 +477,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
         let (version, _) = state.meta(Some(&token)).await;
         let body = req.into_body().collect().await?.to_bytes();
 
-        let send = |body: Bytes| {
+        let send = |body: &Bytes| {
             state
                 .http
                 .post(format!("{}/v1/chat/completions", state.cfg.base_url))
@@ -474,11 +485,11 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
                 .header(header::CONTENT_TYPE, content_type.as_str())
                 .header("x-client-version", version.as_str())
                 .header("x-session-id", session.as_str())
-                .body(body)
+                .body(body.clone())
                 .send()
         };
 
-        let mut upstream = send(body.clone()).await?;
+        let mut upstream = send(&body).await?;
 
         if upstream.status() == StatusCode::FORBIDDEN && state.cfg.auto_ad {
             let status = upstream.status();
@@ -490,7 +501,19 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
             state
                 .report_ad_throttled(&token, &session, Duration::from_secs(10))
                 .await;
-            upstream = send(body).await?;
+            upstream = send(&body).await?;
+        }
+
+        if upstream.status() == StatusCode::CONFLICT {
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            let bytes = upstream.bytes().await?;
+            if !String::from_utf8_lossy(&bytes).contains("concurrent_session")
+                || !state.reset_session(&token).await
+            {
+                return Ok(buffered_response(status, &headers, bytes));
+            }
+            upstream = send(&body).await?;
         }
 
         return Ok(streaming_response(upstream));
@@ -658,6 +681,7 @@ mod tests {
     struct Captured {
         requests: StdMutex<Vec<(String, String, String, String, String)>>,
         gate: std::sync::atomic::AtomicBool,
+        sessions_full: std::sync::atomic::AtomicBool,
     }
 
     async fn mock_upstream(state: Arc<Captured>, addr: SocketAddr) {
@@ -695,7 +719,14 @@ mod tests {
                                         .unwrap()
                                         .iter()
                                         .any(|(path, _, _, _, _)| path == "/ads/impression");
-                                if gated {
+                                let blocked = state.sessions_full.load(std::sync::atomic::Ordering::SeqCst);
+                                if blocked {
+                                    json_error(
+                                        StatusCode::CONFLICT,
+                                        "concurrent_session",
+                                        "free_pi_error",
+                                    )
+                                } else if gated {
                                     json_error(StatusCode::FORBIDDEN, "ads_required", "free_pi_error")
                                 } else if String::from_utf8_lossy(&body).contains("\"stream\":true") {
                                     Response::builder()
@@ -715,6 +746,12 @@ mod tests {
                                 "click_url": "https://example.com/click",
                                 "imp_url": "https://example.com/imp",
                             })),
+                            "/session/reset" => {
+                                state
+                                    .sessions_full
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                json_ok(&json!({ "released": true }))
+                            }
                             "/ads/impression" => json_ok(&json!({ "ok": true })),
                             _ => json_error(StatusCode::NOT_FOUND, "not found", "not_found"),
                         };
@@ -956,6 +993,42 @@ mod tests {
             paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
             2,
             "gated completion is retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_is_reset_and_retried() {
+        let (base, captured) = spawn_bridge_opts(Some("bridge-secret"), false).await;
+        captured
+            .sessions_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = test_client();
+
+        let chat = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200, "retry after reset must reach the model");
+
+        let paths: Vec<String> = captured
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.0.clone())
+            .collect();
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/session/reset").count(),
+            1,
+            "a stuck session is reset once"
+        );
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
+            2,
+            "blocked completion is retried once"
         );
     }
 }
