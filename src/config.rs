@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::state::state_dir;
 
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 14] = [
     "FREEPI_BASE_URL",
     "FREEPI_TOKEN",
     "FREEPI_CREDENTIALS",
@@ -14,6 +14,8 @@ const KNOWN: [&str; 12] = [
     "FREEPI_BRIDGE_INSECURE",
     "FREEPI_AUTO_AD",
     "FREEPI_AD_REFRESH_SECS",
+    "FREEPI_MAX_INFLIGHT",
+    "FREEPI_QUEUE_WAIT_SECS",
     "FREEPI_AUTO_UPDATE",
     "FREEPI_BRIDGE_DOWNLOAD_BASE",
     "TZ",
@@ -37,6 +39,12 @@ FREEPI_AUTO_AD=1
 
 # Seconds between automatic ad reports; values under 30 are ignored.
 FREEPI_AD_REFRESH_SECS=600
+
+# FreePi serves one completion per account. A second request waits for the slot
+# instead of failing with "429 concurrent"; 0 disables the gate and lets
+# everything through at once.
+# FREEPI_MAX_INFLIGHT=1
+# FREEPI_QUEUE_WAIT_SECS=30
 
 # Shared key clients must send as "authorization: Bearer ...". Empty = no key.
 BRIDGE_API_KEY=

@@ -5,15 +5,13 @@
 **HTTP API kompatibel OpenAI untuk akun FreePi.**<br>
 Satu binary Rust, tanpa runtime dan tanpa layanan tambahan.
 
-![version](https://img.shields.io/badge/version-0.2.1-blue)
+![version](https://img.shields.io/badge/version-0.2.2-blue)
 ![msrv](https://img.shields.io/badge/msrv-1.89%2B-orange)
 ![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 </div>
 
 Language: [English](README.md) | Indonesia
-
-API kompatibel OpenAI untuk akun FreePi. Satu binary Rust statis, tanpa runtime.
 
 API FreePi hanya menerima klien resminya sendiri dan butuh impresi iklan sebelum
 completion gratis bisa dipakai. Bridge ini menangani keduanya dan meneruskan
@@ -39,7 +37,8 @@ di suatu mesin.
 4. **Arahkan aplikasimu ke bridge**:
    - Base URL: `http://127.0.0.1:8787/v1`
    - API key: `BRIDGE_API_KEY` jika kamu mengaturnya, kalau tidak isi placeholder apa saja
-   - Model: pilih dari hasil `freepi-bridge models`
+   - Model: id apa pun dari `freepi-bridge models`, atau dari
+     [freepi.ai/models](https://freepi.ai/models) yang juga menampilkan kuota
 
 Coba:
 
@@ -48,9 +47,6 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"particle","messages":[{"role":"user","content":"hi"}]}'
 ```
-
-`freepi-bridge models` mencetak seluruh katalog. `deepseek-v4.1-flash` pilihan
-bagus untuk coding.
 
 > **Windows PowerShell 5.1:** `curl` adalah alias untuk `Invoke-WebRequest`.
 > Pakai `curl.exe`, atau:
@@ -137,13 +133,15 @@ freepi-bridge logs | grep 'ad impression'
 | `stop`, `restart` | kontrol daemon |
 | `status`, `logs [-f]` | pantau daemon |
 | `models` | tampilkan model yang tersedia |
+| `usage` | kredit, lane, dan pemakaian token hari ini |
+| `reset [--yes]` | lepas slot sesi yang tertahan klien yang mati |
 | `doctor` | cek token, upstream, bridge, bind |
 | `token`, `ads` | tampilkan JWT yang dipakai / URL halaman iklan |
 | `config [--init]` | tampilkan atau buat `config.env` |
 | `update [--check] [--tag TAG]` | instal rilis terbaru (atau rilis tertentu) |
 
 Exit code `0` jika sukses, `1` jika error. Tambahkan `--json` pada `status`,
-`models`, dan `doctor` untuk keperluan script.
+`models`, `usage`, dan `doctor` untuk keperluan script.
 
 ## Konfigurasi
 
@@ -158,8 +156,21 @@ Atur variabel lewat environment atau `~/.freepi-bridge/config.env`
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | alamat listen |
 | `FREEPI_AUTO_AD` | `1` | lapor iklan otomatis, `0` untuk mematikan |
 | `FREEPI_AD_REFRESH_SECS` | `600` | jeda antar laporan dalam detik (min 30) |
+| `FREEPI_MAX_INFLIGHT` | `1` | completion yang dikirim ke upstream sekaligus; `0` mematikan gate |
+| `FREEPI_QUEUE_WAIT_SECS` | `30` | berapa lama request kedua menunggu slot sebelum dijawab `429` |
 | `FREEPI_AUTO_UPDATE` | tidak diatur | `start --bg` dan `restart` memeriksa paling banyak sekali sehari: tidak diatur = cetak pemberitahuan, `1` = pasang rilisnya, `0` = tidak pernah memeriksa. Daemon yang sedang berjalan tidak pernah memeriksa sendiri |
 | `FREEPI_BRIDGE_DIR` | `~/.freepi-bridge` | direktori state dan log |
+| `FREEPI_CREDENTIALS` | `~/.free-pi/agent/credentials.json` | file token yang dibaca bridge |
+| `FREEPI_BASE_URL` | `https://api.freepi.ai` | base URL upstream; arahkan ke mirror atau server uji |
+| `FREEPI_BRIDGE_DOWNLOAD_BASE` | tidak diatur | mirror unduhan rilis untuk `update` |
+| `FREEPI_BRIDGE_INSECURE` | tidak diatur | `1` sama dengan `--insecure`, untuk platform yang tidak bisa mengoper flag |
+| `TZ` | `UTC` | zona waktu yang dikirim pada request iklan |
+
+FreePi melayani satu completion per akun pada satu waktu. Bridge karena itu
+memegang slotnya dan membiarkan request kedua menunggu, bukan langsung gagal,
+sampai `FREEPI_QUEUE_WAIT_SECS`. Request yang menyerah menunggu dijawab `429`
+dengan `Retry-After`. Setel `FREEPI_QUEUE_WAIT_SECS=0` untuk gagal cepat, atau
+`FREEPI_MAX_INFLIGHT=0` untuk meneruskan semua request tanpa gate.
 
 Bind ke alamat non-loopback (`--bind 0.0.0.0`) mewajibkan `BRIDGE_API_KEY`
 kecuali memakai `--insecure`.
@@ -202,11 +213,11 @@ Diinstal dengan `--system` atau `PREFIX`? Hapus binary dari lokasi tersebut.
 | `401` | token tidak ditemukan: jalankan `freepi-bridge token`, jika kosong lihat [Token](#token) |
 | `403 ads_required` | lihat [Iklan](#iklan); `FREEPI_AUTO_AD=1` membersihkannya tanpa browser |
 | `403` padahal browser terbuka | halamannya tidak dihitung; biarkan `/ads` terlihat dan cek `freepi-bridge logs \| grep 'ad impression'` |
-| `409 concurrent_session` | akun sudah memegang empat slot sesi CLI; bridge memanggil `/session/reset` lalu mengulang sekali, dan kalau tetap gagal berarti mesin lain memegang slot |
+| `409 concurrent_session` | akun sudah memegang empat slot sesi CLI; bridge memanggil `/session/reset` lalu mengulang sekali. Kalau tetap gagal, mesin lain memegang slot: tutup klien itu lalu jalankan `freepi-bridge reset` |
 | `409 model_at_capacity` | model itu sedang penuh di upstream; tunggu beberapa menit atau pilih model gratis lain |
-| `429 concurrent` | satu request aktif per akun; klien lain atau agent kedua memakai akun FreePi yang sama |
+| `429 concurrent` | akun hanya melayani satu request sekaligus dan bridge sudah menunggu `FREEPI_QUEUE_WAIT_SECS` tanpa dapat slot; klien lain terus memegangnya, jadi naikkan jeda tunggu atau beri agent kedua akun sendiri |
 | `429 hourly_ceiling` | batas per jam tercapai, tunggu reset. Iklan tidak bisa dilewati, dan batasnya per akun |
-| `429 premium_allowance` | kuota premium habis; pindah ke model bertanda `Free Unlimited` di `freepi-bridge models` (`particle`, `deepseek-v4.1-flash`, `glm-5.3-flash`, `deepseek-v4-flash`), karena akhiran `-flash` tidak membuat model jadi gratis |
+| `429 premium_allowance` | kuota premium habis; pindah ke model yang melaporkan `"free": true` di `freepi-bridge models --json`, karena akhiran `-flash` tidak membuat model jadi gratis |
 | lainnya | jalankan `freepi-bridge doctor`, lalu `freepi-bridge logs` |
 
 ## Endpoint

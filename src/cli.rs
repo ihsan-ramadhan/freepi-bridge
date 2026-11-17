@@ -29,6 +29,7 @@ struct Flags {
     check: bool,
     tag: Option<String>,
     init: bool,
+    yes: bool,
     positionals: Vec<String>,
 }
 
@@ -45,6 +46,8 @@ Commands:
   restart     stop, then start --bg again
   status      daemon status (--json for machines)
   models      list the models FreePi serves (--json)
+  usage       today's credits, lane and token spend (--json)
+  reset       free a session slot held by a crashed client (--yes to skip the prompt)
   doctor      check token, upstream, bridge and bind safety
   logs        print the bridge log (-f to follow)
   token       print the FreePi JWT the bridge uses
@@ -57,11 +60,12 @@ Flags:
   --port N          listen port (default 8787)
   --bind H          listen address (default 127.0.0.1)
   --bg              detach after starting
-  --json            machine-readable output (status, models, doctor)
+  --json            machine-readable output (status, models, usage, doctor)
   --insecure        allow a non-loopback bind without BRIDGE_API_KEY
   --check           only report whether a newer release exists (update)
   --tag TAG         install a specific release (update, e.g. v0.1.2)
   --init            create the config file if it is missing (config)
+  --yes, -y         skip the confirmation prompt (reset)
   -f, --follow      follow the log
   -h, --help        this help; \"freepi-bridge <command> --help\" per command
   -V, --version     print the version
@@ -75,6 +79,8 @@ Environment:
   FREEPI_BRIDGE_DIR     state and log directory (default ~/.freepi-bridge)
   FREEPI_AUTO_UPDATE    update check on \"start --bg\"; 1 installs, 0 never checks
   FREEPI_BRIDGE_DOWNLOAD_BASE  mirror for release downloads
+  FREEPI_MAX_INFLIGHT   completions allowed upstream at once (default 1, 0 = no limit)
+  FREEPI_QUEUE_WAIT_SECS  how long a second request waits for the slot (default 30)
   TZ                    timezone sent with ad requests
 
 Defaults:
@@ -94,6 +100,8 @@ fn command_help(command: &str) -> bool {
         "restart" => "freepi-bridge restart [--port N] [--bind H]",
         "status" => "freepi-bridge status [--json]",
         "models" => "freepi-bridge models [--json]",
+        "usage" => "freepi-bridge usage [--json]",
+        "reset" => "freepi-bridge reset [--yes]",
         "doctor" => "freepi-bridge doctor [--json]",
         "logs" => "freepi-bridge logs [-f]",
         "token" => "freepi-bridge token",
@@ -118,6 +126,7 @@ fn parse(argv: Vec<String>) -> Result<Flags, String> {
             "--insecure" => flags.insecure = true,
             "--follow" | "-f" => flags.follow = true,
             "--check" => flags.check = true,
+            "--yes" | "-y" => flags.yes = true,
             "--init" => flags.init = true,
             "--tag" => {
                 index += 1;
@@ -208,14 +217,20 @@ fn client() -> reqwest::Client {
 }
 
 async fn probe_health(host: &str, port: u16) -> bool {
+    bridge_health(host, port).await.is_some()
+}
+
+async fn bridge_health(host: &str, port: u16) -> Option<Value> {
     let probe_host = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
     client()
         .get(format!("{}/health", host_url(probe_host, port)))
         .timeout(Duration::from_millis(800))
         .send()
         .await
-        .map(|res| res.status().is_success())
-        .unwrap_or(false)
+        .ok()?
+        .json()
+        .await
+        .ok()
 }
 
 async fn wait_healthy(host: &str, port: u16) -> bool {
@@ -237,7 +252,7 @@ async fn bridge_model_count(host: &str, port: u16) -> Option<usize> {
     Some(payload.get("data")?.as_array()?.len())
 }
 
-async fn fetch_catalog() -> Result<(String, Vec<(String, String)>), String> {
+async fn fetch_catalog() -> Result<(String, Vec<Value>), String> {
     let mut request = client()
         .get(format!("{}/client-version", resolve_base_url()))
         .timeout(Duration::from_secs(8));
@@ -258,7 +273,7 @@ async fn fetch_catalog() -> Result<(String, Vec<(String, String)>), String> {
     Ok((version, catalog_models(&payload)))
 }
 
-fn catalog_models(payload: &Value) -> Vec<(String, String)> {
+fn catalog_models(payload: &Value) -> Vec<Value> {
     payload
         .get("models")
         .and_then(Value::as_array)
@@ -267,12 +282,26 @@ fn catalog_models(payload: &Value) -> Vec<(String, String)> {
                 .iter()
                 .filter_map(|entry| {
                     let id = entry.get("id")?.as_str()?;
+                    if id.is_empty() {
+                        return None;
+                    }
                     let name = entry
                         .get("name")
                         .and_then(Value::as_str)
                         .or_else(|| entry.get("display_name").and_then(Value::as_str))
                         .unwrap_or(id);
-                    Some((id.to_string(), name.to_string()))
+                    let mut model = json!({
+                        "id": id,
+                        "name": name,
+                        "free": entry.get("free").and_then(Value::as_bool).unwrap_or(false),
+                    });
+                    if let Some(usage) = entry.get("usage_x").and_then(Value::as_f64) {
+                        model["usage_x"] = json!(usage);
+                    }
+                    if let Some(note) = entry.get("note").and_then(Value::as_str) {
+                        model["note"] = json!(note);
+                    }
+                    Some(model)
                 })
                 .collect::<Vec<_>>()
         })
@@ -440,7 +469,13 @@ async fn cmd_status(flags: Flags) -> i32 {
         return 1;
     };
     let alive = pid_alive(state.pid);
-    let healthy = alive && probe_health(&state.host, state.port).await;
+    let health = if alive { bridge_health(&state.host, state.port).await } else { None };
+    let healthy = health.is_some();
+    let running = health
+        .as_ref()
+        .and_then(|payload| payload.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let models = if healthy {
         bridge_model_count(&state.host, state.port).await
     } else {
@@ -457,11 +492,16 @@ async fn cmd_status(flags: Flags) -> i32 {
                 "pid": state.pid,
                 "url": url,
                 "models": models,
+                "version": running,
             })
         );
     } else if healthy {
         let count = models.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-        println!("status: running (pid {}) at {url} · {count} models", state.pid);
+        let version = running.as_deref().unwrap_or("unknown version");
+        println!("status: running (pid {}, {version}) at {url} · {count} models", state.pid);
+        if let Some(running) = running.as_deref().filter(|running| *running != VERSION) {
+            println!("note: this binary is v{VERSION}, the daemon runs v{running} — run `freepi-bridge restart` to match");
+        }
     } else {
         println!("status: unhealthy (pid {}) at {url}", state.pid);
     }
@@ -473,15 +513,23 @@ async fn cmd_models(flags: Flags) -> i32 {
     match fetch_catalog().await {
         Ok((version, models)) => {
             if flags.json {
-                let data: Vec<Value> = models
-                    .iter()
-                    .map(|(id, name)| json!({ "id": id, "name": name }))
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&json!({ "version": version, "data": data })).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "version": version, "data": models }))
+                        .unwrap_or_default()
+                );
             } else {
                 println!("FreePi client {version} · {} models", models.len());
-                let width = models.iter().map(|(id, _)| id.len()).max().unwrap_or(0).max(4);
-                for (id, name) in &models {
+                let width = models
+                    .iter()
+                    .filter_map(|model| model["id"].as_str())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0)
+                    .max(4);
+                for model in &models {
+                    let id = model["id"].as_str().unwrap_or_default();
+                    let name = model["name"].as_str().unwrap_or(id);
                     println!("  {id:<width$}  {name}");
                 }
             }
@@ -492,6 +540,180 @@ async fn cmd_models(flags: Flags) -> i32 {
             1
         }
     }
+}
+
+fn compact(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn json_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn json_text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("?")
+}
+
+async fn cmd_usage(flags: Flags) -> i32 {
+    let Some(token) = resolve_token() else {
+        eprintln!(
+            "no FreePi token in FREEPI_TOKEN or {}; run `npx free-pi-cli@latest` once to sign in",
+            credentials_path().display()
+        );
+        return 1;
+    };
+
+    let response = match client()
+        .get(format!("{}/me/stats", resolve_base_url()))
+        .bearer_auth(&token)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("cannot reach FreePi: {err}");
+            return 1;
+        }
+    };
+
+    let status = response.status();
+    let payload: Value = match response.json().await {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("cannot read the usage report: {err}");
+            return 1;
+        }
+    };
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("FreePi refused the request");
+        eprintln!("{status}: {message}");
+        return 1;
+    }
+
+    if flags.json {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        return 0;
+    }
+
+    let allowance = json_u64(&payload, "allowance_credits");
+    let remaining = json_u64(&payload, "remaining_credits_today");
+    let used = allowance.saturating_sub(remaining);
+    let percent = if allowance > 0 {
+        (used as f64 / allowance as f64 * 100.0).round() as u64
+    } else {
+        0
+    };
+
+    println!(
+        "tier {} · lane {}",
+        json_text(&payload, "tier"),
+        json_text(&payload, "lane")
+    );
+    println!("credits  {remaining} / {allowance} today ({percent}% used)");
+    if let Some(refill) = payload.get("refill_at").and_then(Value::as_str) {
+        let stamp = refill.trim_end_matches('Z').trim_end_matches(".000").replace('T', " ");
+        println!("refill   {stamp} UTC");
+    }
+    let premium = json_u64(&payload, "premium_credits");
+    println!(
+        "premium  {premium} credits{}",
+        if premium == 0 {
+            " — premium models answer 403"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "today    {} requests · {} prompt / {} completion tokens",
+        json_u64(&payload, "request_count_today"),
+        compact(json_u64(&payload, "prompt_tokens_today")),
+        compact(json_u64(&payload, "completion_tokens_today"))
+    );
+    if let Some(lifetime) = payload.get("lifetime") {
+        println!(
+            "lifetime {} requests · {} prompt / {} completion tokens",
+            json_u64(lifetime, "request_count"),
+            compact(json_u64(lifetime, "prompt_tokens")),
+            compact(json_u64(lifetime, "completion_tokens"))
+        );
+    }
+    0
+}
+
+fn confirm(prompt: &str) -> bool {
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+async fn cmd_reset(flags: Flags) -> i32 {
+    let Some(token) = resolve_token() else {
+        eprintln!(
+            "no FreePi token in FREEPI_TOKEN or {}; run `npx free-pi-cli@latest` once to sign in",
+            credentials_path().display()
+        );
+        return 1;
+    };
+
+    if !flags.yes
+        && !confirm(
+            "this signs out every other FreePi session on the account, including a running free-pi-cli; continue? [y/N] ",
+        )
+    {
+        println!("aborted");
+        return 1;
+    }
+
+    let response = match client()
+        .post(format!("{}/session/reset", resolve_base_url()))
+        .bearer_auth(&token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("cannot reach FreePi: {err}");
+            return 1;
+        }
+    };
+
+    let status = response.status();
+    let payload: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("FreePi refused the request");
+        eprintln!("{status}: {message}");
+        return 1;
+    }
+
+    let released = payload.get("released").and_then(Value::as_bool).unwrap_or(false);
+    if flags.json {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    } else if released {
+        println!("released the other session; the bridge can start a new one now");
+    } else {
+        println!("no other session was running");
+    }
+    0
 }
 
 fn cmd_token() -> i32 {
@@ -971,6 +1193,8 @@ pub(crate) async fn run(argv: Vec<String>) -> i32 {
         "restart" => cmd_restart(flags).await,
         "status" => cmd_status(flags).await,
         "models" => cmd_models(flags).await,
+        "usage" => cmd_usage(flags).await,
+        "reset" => cmd_reset(flags).await,
         "doctor" => cmd_doctor(flags).await,
         "logs" => cmd_logs(flags),
         "token" => cmd_token(),
@@ -1016,18 +1240,26 @@ mod tests {
     fn catalog_keeps_the_marker_that_says_whether_a_model_is_free() {
         let payload = json!({
             "models": [
-                { "id": "particle", "name": "Particle · Free Unlimited", "display_name": "Particle" },
-                { "id": "solar-pro-4", "name": "Solar Pro 4 · ~0.6x usage", "display_name": "Solar Pro 4" },
+                { "id": "particle", "name": "Particle · Free Unlimited", "display_name": "Particle", "free": true, "usage_x": null, "note": null },
+                { "id": "solar-pro-4", "name": "Solar Pro 4 · ~0.6x usage", "display_name": "Solar Pro 4", "free": false, "usage_x": 0.6 },
                 { "id": "bare" }
             ]
         });
         assert_eq!(
             catalog_models(&payload),
             vec![
-                ("particle".to_string(), "Particle · Free Unlimited".to_string()),
-                ("solar-pro-4".to_string(), "Solar Pro 4 · ~0.6x usage".to_string()),
-                ("bare".to_string(), "bare".to_string()),
+                json!({ "id": "particle", "name": "Particle · Free Unlimited", "free": true }),
+                json!({ "id": "solar-pro-4", "name": "Solar Pro 4 · ~0.6x usage", "free": false, "usage_x": 0.6 }),
+                json!({ "id": "bare", "name": "bare", "free": false }),
             ]
         );
+    }
+
+    #[test]
+    fn compact_keeps_small_counts_readable() {
+        assert_eq!(compact(0), "0");
+        assert_eq!(compact(999), "999");
+        assert_eq!(compact(39_151), "39.2k");
+        assert_eq!(compact(8_697_843), "8.70M");
     }
 }

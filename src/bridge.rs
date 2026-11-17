@@ -7,19 +7,20 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::{body::Incoming, header, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResBody = BoxBody<Bytes, BoxError>;
 
-const META_TTL: Duration = Duration::from_secs(300);
+const META_TTL: Duration = Duration::from_secs(60);
 const FALLBACK_VERSION: &str = "0.6.21";
 const DEFAULT_BASE_URL: &str = "https://api.freepi.ai";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct Config {
     base_url: String,
@@ -42,6 +43,8 @@ pub(crate) struct State {
     meta: Mutex<Option<Meta>>,
     session: String,
     ad: Mutex<Option<Instant>>,
+    gate: Option<Arc<Semaphore>>,
+    queue_wait: Duration,
 }
 
 fn full(bytes: Bytes) -> ResBody {
@@ -398,7 +401,24 @@ fn buffered_response(status: StatusCode, headers: &reqwest::header::HeaderMap, b
     builder.body(full(bytes)).expect("response")
 }
 
-fn streaming_response(upstream: reqwest::Response) -> Response<ResBody> {
+fn json_error_retry(
+    status: StatusCode,
+    message: &str,
+    kind: &str,
+    retry_after: u64,
+) -> Response<ResBody> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::RETRY_AFTER, retry_after)
+        .body(json_body(&json!({ "error": { "message": message, "type": kind } })))
+        .expect("static response")
+}
+
+fn streaming_response(
+    upstream: reqwest::Response,
+    hold: Option<OwnedSemaphorePermit>,
+) -> Response<ResBody> {
     let status = upstream.status();
     let (content_type, retry_after) = response_headers(upstream.headers());
     let mut builder = Response::builder().status(status);
@@ -411,7 +431,11 @@ fn streaming_response(upstream: reqwest::Response) -> Response<ResBody> {
     let stream = upstream
         .bytes_stream()
         .map_ok(http_body::Frame::data)
-        .map_err(|err| Box::new(err) as BoxError);
+        .map_err(|err| Box::new(err) as BoxError)
+        .map(move |frame| {
+            let _ = &hold;
+            frame
+        });
     builder
         .body(BoxBody::new(StreamBody::new(stream)))
         .expect("response")
@@ -423,11 +447,12 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
     let query = req.uri().query().map(str::to_string);
 
     if method == Method::GET && (path == "/health" || path == "/healthz") {
-        return Ok(json_ok(&json!({ "ok": true })));
+        return Ok(json_ok(&json!({ "ok": true, "version": VERSION })));
     }
     if method == Method::GET && path == "/" {
         return Ok(json_ok(&json!({
             "service": "freepi-bridge",
+            "version": VERSION,
             "status": "ok",
             "endpoints": ["/v1/models", "/v1/chat/completions", "/ads/next", "/ads/impression", "/health"],
         })));
@@ -477,6 +502,21 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
         let (version, _) = state.meta(Some(&token)).await;
         let body = req.into_body().collect().await?.to_bytes();
 
+        let permit = match state.gate.as_ref() {
+            None => None,
+            Some(gate) => match tokio::time::timeout(state.queue_wait, gate.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => {
+                    return Ok(json_error_retry(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "another request is still using this FreePi account; the bridge waited and gave up",
+                        "rate_limit",
+                        5,
+                    ))
+                }
+            },
+        };
+
         let send = |body: &Bytes| {
             state
                 .http
@@ -516,7 +556,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
             upstream = send(&body).await?;
         }
 
-        return Ok(streaming_response(upstream));
+        return Ok(streaming_response(upstream, permit));
     }
 
     if method == Method::GET && path == "/ads/next" {
@@ -613,6 +653,9 @@ pub(crate) fn build_state() -> State {
     };
 
     ensure_crypto_provider();
+    let inflight = env_nonempty("FREEPI_MAX_INFLIGHT")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
     State {
         http: reqwest::Client::builder()
             .pool_max_idle_per_host(64)
@@ -623,6 +666,11 @@ pub(crate) fn build_state() -> State {
         meta: Mutex::new(None),
         session: uuid::Uuid::new_v4().to_string(),
         ad: Mutex::new(None),
+        gate: (inflight > 0).then(|| Arc::new(Semaphore::new(inflight))),
+        queue_wait: env_nonempty("FREEPI_QUEUE_WAIT_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30)),
     }
 }
 
@@ -653,7 +701,7 @@ pub(crate) async fn serve(state: Arc<State>, addr: SocketAddr) -> std::io::Resul
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("freepi-bridge listening on http://{addr}");
+    println!("freepi-bridge {VERSION} listening on http://{addr}");
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
@@ -770,6 +818,16 @@ mod tests {
     }
 
     async fn spawn_bridge_opts(bridge_key: Option<&str>, auto_ad: bool) -> (String, Arc<Captured>) {
+        let (bridge, captured, _) =
+            spawn_bridge_state(bridge_key, auto_ad, Duration::from_secs(30)).await;
+        (bridge, captured)
+    }
+
+    async fn spawn_bridge_state(
+        bridge_key: Option<&str>,
+        auto_ad: bool,
+        queue_wait: Duration,
+    ) -> (String, Arc<Captured>, Arc<State>) {
         let captured = Arc::new(Captured::default());
         let upstream_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = tokio::net::TcpListener::bind(upstream_addr).await.unwrap();
@@ -792,6 +850,8 @@ mod tests {
             meta: Mutex::new(None),
             session: "session-fixed".to_string(),
             ad: Mutex::new(None),
+            gate: Some(Arc::new(Semaphore::new(1))),
+            queue_wait,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -801,7 +861,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         let bridge = format!("http://127.0.0.1:{port}");
-        (bridge, captured)
+        (bridge, captured, state)
     }
 
     async fn spawn_bridge() -> (String, Arc<Captured>) {
@@ -815,13 +875,43 @@ mod tests {
 
         let health = client.get(format!("{base}/health")).send().await.unwrap();
         assert_eq!(health.status(), 200);
-        assert_eq!(health.json::<Value>().await.unwrap(), json!({ "ok": true }));
+        let health: Value = health.json().await.unwrap();
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
 
         let root = client.get(format!("{base}/")).send().await.unwrap();
         assert_eq!(root.status(), 200);
 
         let unauth = client.get(format!("{base}/v1/models")).send().await.unwrap();
         assert_eq!(unauth.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn a_busy_account_answers_429_with_retry_after() {
+        let (base, _, state) =
+            spawn_bridge_state(Some("bridge-secret"), false, Duration::ZERO).await;
+        let client = test_client();
+        let permit = state.gate.as_ref().unwrap().acquire().await.unwrap();
+
+        let busy = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), 429);
+        assert_eq!(busy.headers().get("retry-after").unwrap(), "5");
+
+        drop(permit);
+        let free = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(free.status(), 200);
     }
 
     #[tokio::test]
