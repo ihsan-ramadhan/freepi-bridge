@@ -639,12 +639,7 @@ pub(crate) fn build_state() -> State {
         token: env_nonempty("FREEPI_TOKEN"),
         bridge_key: env_nonempty("BRIDGE_API_KEY"),
         credentials: credentials_path(),
-        auto_ad: !matches!(
-            env_nonempty("FREEPI_AUTO_AD")
-                .map(|value| value.to_ascii_lowercase())
-                .as_deref(),
-            Some("0") | Some("false") | Some("off") | Some("no")
-        ),
+        auto_ad: crate::config::flag("FREEPI_AUTO_AD"),
         ad_refresh: env_nonempty("FREEPI_AD_REFRESH_SECS")
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|secs| *secs >= 30)

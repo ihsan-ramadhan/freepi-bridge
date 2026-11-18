@@ -1,4 +1,5 @@
 mod bridge;
+mod autostart;
 mod cli;
 mod config;
 mod state;

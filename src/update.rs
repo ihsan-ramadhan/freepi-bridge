@@ -7,7 +7,6 @@ use serde_json::Value;
 
 const DEFAULT_DOWNLOAD_BASE: &str = "https://github.com/ihsan-ramadhan/freepi-bridge/releases";
 const LATEST_API: &str = "https://api.github.com/repos/ihsan-ramadhan/freepi-bridge/releases/latest";
-const CHECK_INTERVAL_SECS: u64 = 86_400;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -230,48 +229,6 @@ async fn published_checksum(url: &str) -> Result<Option<String>, String> {
     Ok(text.split_whitespace().next().map(str::to_ascii_lowercase))
 }
 
-pub(crate) async fn latest_release() -> Result<Release, String> {
-    let asset = platform_asset()?;
-    let response = client(Duration::from_secs(8))
-        .get(LATEST_API)
-        .header(reqwest::header::USER_AGENT, user_agent())
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|err| format!("cannot reach GitHub: {err}"))?;
-    match response.status().as_u16() {
-        404 => return Err("no release has been published yet".to_string()),
-        code if !(200..300).contains(&code) => return Err(format!("GitHub answered {code}")),
-        _ => {}
-    }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|err| format!("unreadable release metadata: {err}"))?;
-    let tag = payload
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .filter(|tag| !tag.is_empty())
-        .ok_or("release metadata carries no tag_name")?
-        .to_string();
-    if !valid_tag(&tag) {
-        return Err(format!("unexpected release tag: {tag}"));
-    }
-    if let Some(assets) = payload.get("assets").and_then(Value::as_array) {
-        let names: Vec<&str> = assets
-            .iter()
-            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
-            .collect();
-        if !names.is_empty() && !names.contains(&asset.as_str()) {
-            return Err(format!("release {tag} has no {asset}"));
-        }
-    }
-    Ok(Release {
-        version: normalize_tag(&tag),
-        tag,
-        asset,
-    })
-}
 
 fn work_dir() -> PathBuf {
     std::env::temp_dir().join(format!("freepi-bridge-update-{}", std::process::id()))
@@ -415,34 +372,135 @@ pub(crate) async fn install(release: &Release) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn auto_mode() -> AutoUpdate {
-    let Some(value) = env_nonempty("FREEPI_AUTO_UPDATE").map(|v| v.to_ascii_lowercase()) else {
-        return AutoUpdate::Notify;
+    if env_nonempty("FREEPI_BRIDGE_NO_AUTO_UPDATE").is_some() {
+        return AutoUpdate::Off;
+    }
+    parse_auto_mode(env_nonempty("FREEPI_AUTO_UPDATE").as_deref())
+}
+
+fn parse_auto_mode(value: Option<&str>) -> AutoUpdate {
+    let Some(value) = value.map(|v| v.trim().to_ascii_lowercase()) else {
+        return AutoUpdate::Apply;
     };
     match value.as_str() {
-        "0" | "false" | "off" | "no" => AutoUpdate::Off,
-        "1" | "true" | "on" | "yes" => AutoUpdate::Apply,
-        _ => AutoUpdate::Notify,
+        "" | "on" | "1" | "true" | "yes" | "apply" => AutoUpdate::Apply,
+        "off" | "0" | "false" | "no" => AutoUpdate::Off,
+        "notify" | "check" => AutoUpdate::Notify,
+        _ => AutoUpdate::Apply,
     }
 }
 
-fn stamp_path() -> PathBuf {
-    crate::state::state_dir().join("update-check")
+fn cache_path() -> PathBuf {
+    crate::state::state_dir().join("update-cache.json")
 }
 
-pub(crate) fn check_due() -> bool {
-    let Ok(raw) = fs::read_to_string(stamp_path()) else {
-        return true;
-    };
-    match raw.trim().parse::<u64>() {
-        Ok(last) => now_secs().saturating_sub(last) >= CHECK_INTERVAL_SECS,
-        Err(_) => true,
-    }
+fn read_cache() -> Option<(u64, String, String)> {
+    let raw = fs::read_to_string(cache_path()).ok()?;
+    let payload: Value = serde_json::from_str(&raw).ok()?;
+    Some((
+        payload.get("at")?.as_u64()?,
+        payload.get("etag")?.as_str()?.to_string(),
+        payload.get("tag")?.as_str()?.to_string(),
+    ))
 }
 
-pub(crate) fn mark_checked() {
+fn write_cache(at: u64, etag: &str, tag: &str) {
     let dir = crate::state::state_dir();
     let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(dir.join("update-check"), now_secs().to_string());
+    let payload = serde_json::json!({ "at": at, "etag": etag, "tag": tag });
+    let _ = fs::write(cache_path(), payload.to_string());
+}
+
+pub(crate) fn cached_tag() -> Option<String> {
+    read_cache().map(|(_, _, tag)| tag).filter(|tag| valid_tag(tag))
+}
+
+const CACHE_TTL_SECS: u64 = 60;
+
+fn has_asset(payload: &Value, asset: &str, tag: &str) -> Result<(), String> {
+    if let Some(assets) = payload.get("assets").and_then(Value::as_array) {
+        let names: Vec<&str> = assets
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .collect();
+        if !names.is_empty() && !names.contains(&asset) {
+            return Err(format!("release {tag} has no {asset}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn latest_release_cached() -> Result<Release, String> {
+    let asset = platform_asset()?;
+    let cached = read_cache();
+
+    if let Some((at, _, tag)) = cached.as_ref() {
+        if now_secs().saturating_sub(*at) < CACHE_TTL_SECS && valid_tag(tag) {
+            return Ok(Release {
+                version: normalize_tag(tag),
+                tag: tag.clone(),
+                asset,
+            });
+        }
+    }
+
+    let mut request = client(Duration::from_secs(8))
+        .get(LATEST_API)
+        .header(reqwest::header::USER_AGENT, user_agent())
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+    if let Some((_, etag, _)) = cached.as_ref() {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("cannot reach GitHub: {err}"))?;
+
+    match response.status().as_u16() {
+        304 => {}
+        404 => return Err("no release has been published yet".to_string()),
+        code if !(200..300).contains(&code) => return Err(format!("GitHub answered {code}")),
+        _ => {}
+    }
+
+    if response.status().as_u16() == 304 {
+        if let Some((_, etag, tag)) = cached.filter(|(_, _, tag)| valid_tag(tag)) {
+            write_cache(now_secs(), &etag, &tag);
+            return Ok(Release {
+                version: normalize_tag(&tag),
+                tag,
+                asset,
+            });
+        }
+        return Err("GitHub answered 304 without a cached release".to_string());
+    }
+
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|err| format!("unreadable release metadata: {err}"))?;
+    let tag = payload
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .ok_or("release metadata carries no tag_name")?
+        .to_string();
+    if !valid_tag(&tag) {
+        return Err(format!("unexpected release tag: {tag}"));
+    }
+    has_asset(&payload, &asset, &tag)?;
+    write_cache(now_secs(), etag.as_deref().unwrap_or(""), &tag);
+    Ok(Release {
+        version: normalize_tag(&tag),
+        tag,
+        asset,
+    })
 }
 
 #[cfg(test)]
@@ -503,5 +561,17 @@ mod tests {
             sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
+    }
+
+    #[test]
+    fn auto_update_defaults_to_on_and_speaks_plain_on_off() {
+        assert_eq!(parse_auto_mode(None), AutoUpdate::Apply);
+        assert_eq!(parse_auto_mode(Some("")), AutoUpdate::Apply);
+        assert_eq!(parse_auto_mode(Some("on")), AutoUpdate::Apply);
+        assert_eq!(parse_auto_mode(Some(" ON ")), AutoUpdate::Apply);
+        assert_eq!(parse_auto_mode(Some("off")), AutoUpdate::Off);
+        assert_eq!(parse_auto_mode(Some("0")), AutoUpdate::Off);
+        assert_eq!(parse_auto_mode(Some("notify")), AutoUpdate::Notify);
+        assert_eq!(parse_auto_mode(Some("of")), AutoUpdate::Apply);
     }
 }

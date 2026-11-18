@@ -5,6 +5,10 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 pub(crate) const DEFAULT_PORT: u16 = 8787;
 pub(crate) const SPACE_PORT: u16 = 7860;
 
@@ -15,7 +19,6 @@ pub(crate) struct DaemonState {
     pub port: u16,
 }
 
-/// `HOME` on unix, `USERPROFILE` on Windows (for WSL and Cygwin-style shells).
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .ok()
@@ -71,8 +74,6 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// `tasklist` CSV: `"image","pid","session","mem"`. Compare the pid field, not
-/// a substring, so the memory column cannot produce a false positive.
 #[cfg(windows)]
 pub(crate) fn pid_alive(pid: u32) -> bool {
     let Ok(output) = Command::new("tasklist")
@@ -93,7 +94,6 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     })
 }
 
-/// Ask the process to exit; SIGTERM on unix, plain `taskkill` on Windows.
 #[cfg(unix)]
 pub(crate) fn terminate(pid: u32) -> bool {
     Command::new("kill")

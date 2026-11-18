@@ -26,16 +26,17 @@ pub(crate) const TEMPLATE: &str = r#"# freepi-bridge configuration
 # Read at every start, so the daemon keeps these settings after a reboot
 # without exports in a shell profile. A variable already exported in the
 # environment wins over this file, which keeps one-off overrides working:
-#   FREEPI_AUTO_AD=0 freepi-bridge start --bg
+#   FREEPI_AUTO_AD=off freepi-bridge start --bg
 #
 # Apply edits with: freepi-bridge restart
 # Show this file:   freepi-bridge config
+# Change one line:  freepi-bridge config --set FREEPI_AUTO_UPDATE=off
 
 # Report ads from the bridge itself, so hosts that cannot open /ads
-# (container, CI runner) still get completions. 1 = on, 0 = off.
-# Reporting an ad nobody saw can get the account reviewed, so set 0 wherever a
+# (container, CI runner) still get completions. on = report, off = never.
+# Reporting an ad nobody saw can get the account reviewed, so set off wherever a
 # browser can keep the ad page open.
-FREEPI_AUTO_AD=1
+FREEPI_AUTO_AD=on
 
 # Seconds between automatic ad reports; values under 30 are ignored.
 FREEPI_AD_REFRESH_SECS=600
@@ -58,10 +59,10 @@ BRIDGE_API_KEY=
 # FREEPI_BASE_URL=https://api.freepi.ai
 
 # Safety valve for a non-loopback bind without BRIDGE_API_KEY.
-# FREEPI_BRIDGE_INSECURE=0
+# FREEPI_BRIDGE_INSECURE=off
 
-# Update check on "start --bg": 1 installs, 0 never checks, empty = notify only.
-# FREEPI_AUTO_UPDATE=
+# on installs a newer release, off never checks, notify only prints.
+FREEPI_AUTO_UPDATE=on
 
 # Mirror for update downloads.
 # FREEPI_BRIDGE_DOWNLOAD_BASE=https://github.com/ihsan-ramadhan/freepi-bridge/releases
@@ -72,6 +73,118 @@ BRIDGE_API_KEY=
 
 pub(crate) fn config_path() -> PathBuf {
     state_dir().join("config.env")
+}
+
+pub(crate) fn set(key: &str, value: &str) -> Result<(), String> {
+    if !KNOWN.contains(&key) {
+        return Err(format!("unknown key {key}"));
+    }
+    if value.contains('\0') || value.contains('\n') {
+        return Err(format!("{key} cannot contain a newline or NUL"));
+    }
+    if parse_value(value) != value {
+        return Err(format!(
+            "{key} would be truncated on the next read: {value:?} (quote it, or drop the \" #\")"
+        ));
+    }
+    validate(key, value)?;
+    ensure_file()?;
+    let path = config_path();
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+
+    let out = rewrite(&text, key, value);
+    let temp = path.with_extension("env.tmp");
+    fs::write(&temp, out).map_err(|err| format!("cannot write {}: {err}", temp.display()))?;
+    fs::rename(&temp, &path).map_err(|err| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot replace {}: {err}", path.display())
+    })
+}
+
+fn rewrite(text: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len() + key.len() + value.len() + 2);
+    let mut replaced = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let matches = !trimmed.starts_with('#')
+            && trimmed.split_once('=').map(|(k, _)| k.trim()) == Some(key);
+        if matches {
+            if !replaced {
+                out.push_str(&format!("{key}={value}\n"));
+                replaced = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !replaced {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    out
+}
+
+pub(crate) fn flag(key: &str) -> bool {
+    let Some(raw) = crate::state::env_nonempty(key) else {
+        return true;
+    };
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+fn validate(key: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    let number = |min: u64| -> Result<(), String> {
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| format!("{key} needs a whole number, got {value:?}"))?;
+        if parsed < min {
+            return Err(format!("{key} must be at least {min}, got {parsed}"));
+        }
+        Ok(())
+    };
+    match key {
+        "PORT" if !value.is_empty() => {
+            let port = value
+                .parse::<u16>()
+                .map_err(|_| format!("PORT needs 1-65535, got {value:?}"))?;
+            if port == 0 {
+                return Err("PORT needs 1-65535, got 0".to_string());
+            }
+        }
+        "FREEPI_AD_REFRESH_SECS" if !value.is_empty() => number(30)?,
+        "FREEPI_MAX_INFLIGHT" | "FREEPI_QUEUE_WAIT_SECS" if !value.is_empty() => number(0)?,
+        "FREEPI_BRIDGE_INSECURE" | "FREEPI_AUTO_AD" if !value.is_empty() => {
+            let ok = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "off" | "true" | "false" | "yes" | "no" | "1" | "0"
+            );
+            if !ok {
+                return Err(format!("{key} needs on or off, got {value:?}"));
+            }
+        }
+        "FREEPI_AUTO_UPDATE" if !value.is_empty() => {
+            let ok = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "off" | "notify" | "apply" | "check" | "true" | "false" | "yes" | "no"
+            );
+            if !ok {
+                return Err(format!("FREEPI_AUTO_UPDATE needs on, off or notify, got {value:?}"));
+            }
+        }
+        "FREEPI_BASE_URL" | "FREEPI_BRIDGE_DOWNLOAD_BASE"
+            if !value.is_empty()
+                && !value.starts_with("http://")
+                && !value.starts_with("https://") =>
+        {
+            return Err(format!("{key} needs an http(s) URL, got {value:?}"));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_file() -> Result<bool, String> {
@@ -247,13 +360,57 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_replaces_one_line_and_keeps_comments() {
+        let text = TEMPLATE;
+        let out = rewrite(text, "FREEPI_AUTO_UPDATE", "off");
+
+        assert_eq!(out.lines().filter(|l| l.starts_with("FREEPI_AUTO_UPDATE=")).count(), 1);
+        assert!(out.contains("\nFREEPI_AUTO_UPDATE=off\n"));
+        assert!(!out.contains("FREEPI_AUTO_UPDATE=on"));
+        assert_eq!(out.lines().count(), text.lines().count());
+        assert!(out.contains("# Report ads from the bridge itself"));
+        assert!(rewrite("A=1\n", "TZ", "UTC").contains("TZ=UTC\n"));
+        assert_eq!(rewrite("PORT=1\nPORT=2\n", "PORT", "3"), "PORT=3\n");
+    }
+
+    #[test]
+    fn set_rejects_values_the_binary_would_ignore() {
+        assert!(set("FREEPI_BRIDGE_DIR", "/tmp").is_err(), "unknown keys are rejected");
+        assert!(set("PORT", "abc").is_err(), "non-numeric port is refused");
+        assert!(set("PORT", "0").is_err(), "port 0 is refused");
+        assert!(set("FREEPI_AD_REFRESH_SECS", "5").is_err(), "refresh under 30 is refused");
+        assert!(set("FREEPI_AUTO_UPDATE", "maybe").is_err(), "unknown mode is refused");
+        assert!(set("FREEPI_BASE_URL", "api.freepi.ai").is_err(), "URL without scheme is refused");
+        assert!(set("TZ", "UTC # comment").is_err(), "a value parse_value would cut is refused");
+        assert!(validate("PORT", "").is_ok(), "empty resets a key to its default");
+        assert!(validate("FREEPI_AUTO_UPDATE", "").is_ok());
+    }
+
+    #[test]
+    fn one_boolean_vocabulary_for_every_flag() {
+        for key in ["FREEPI_AUTO_AD", "FREEPI_BRIDGE_INSECURE"] {
+            for off in ["off", "0", "false", "no", " OFF "] {
+                assert!(validate(key, off).is_ok(), "{key}={off} must be accepted");
+            }
+            for on in ["on", "1", "true", "yes"] {
+                assert!(validate(key, on).is_ok(), "{key}={on} must be accepted");
+            }
+            assert!(validate(key, "maybe").is_err());
+        }
+    }
+
+    #[test]
     fn shipped_template_is_valid() {
         let parsed = parse(TEMPLATE);
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
         assert!(parsed
             .entries
             .iter()
-            .any(|(key, value)| key == "FREEPI_AUTO_AD" && value == "1"));
+            .any(|(key, value)| key == "FREEPI_AUTO_AD" && value == "on"));
+        assert!(parsed
+            .entries
+            .iter()
+            .any(|(key, value)| key == "FREEPI_AUTO_UPDATE" && value == "on"));
     }
 
     #[test]

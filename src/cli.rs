@@ -8,12 +8,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::autostart;
 use crate::bridge::{build_state, serve};
+use crate::config;
 use crate::state::{
     clear_state, force_kill, home_dir, is_loopback, log_path, pid_alive, read_state, state_dir,
     terminate, write_state, DEFAULT_PORT, SPACE_PORT,
 };
-use crate::config;
 use crate::update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,7 +30,10 @@ struct Flags {
     check: bool,
     tag: Option<String>,
     init: bool,
+    set: Option<String>,
     yes: bool,
+    enable: bool,
+    disable: bool,
     positionals: Vec<String>,
 }
 
@@ -52,7 +56,8 @@ Commands:
   logs        print the bridge log (-f to follow)
   token       print the FreePi JWT the bridge uses
   ads         print the ad page URL
-  config      show the config file (--init = create it if missing)
+  config      show the config file (--init, --set KEY=VALUE)
+  autostart   run at login and reboot (--enable, --disable)
   update      install the latest release (--check = report only)
   version     print the version
 
@@ -65,6 +70,9 @@ Flags:
   --check           only report whether a newer release exists (update)
   --tag TAG         install a specific release (update, e.g. v0.1.2)
   --init            create the config file if it is missing (config)
+  --set KEY=VALUE   write one setting to the config file (config)
+  --enable          install the autostart unit/service (autostart)
+  --disable         remove it (autostart)
   --yes, -y         skip the confirmation prompt (reset)
   -f, --follow      follow the log
   -h, --help        this help; \"freepi-bridge <command> --help\" per command
@@ -77,7 +85,7 @@ Environment:
   BRIDGE_API_KEY        shared key clients must send
   HOST / PORT           listen address and port
   FREEPI_BRIDGE_DIR     state and log directory (default ~/.freepi-bridge)
-  FREEPI_AUTO_UPDATE    update check on \"start --bg\"; 1 installs, 0 never checks
+  FREEPI_AUTO_UPDATE    on (default) installs updates, off disables, notify only prints
   FREEPI_BRIDGE_DOWNLOAD_BASE  mirror for release downloads
   FREEPI_MAX_INFLIGHT   completions allowed upstream at once (default 1, 0 = no limit)
   FREEPI_QUEUE_WAIT_SECS  how long a second request waits for the slot (default 30)
@@ -106,7 +114,8 @@ fn command_help(command: &str) -> bool {
         "logs" => "freepi-bridge logs [-f]",
         "token" => "freepi-bridge token",
         "ads" => "freepi-bridge ads",
-        "config" => "freepi-bridge config [--init]",
+        "config" => "freepi-bridge config [--init] [--set KEY=VALUE]",
+        "autostart" => "freepi-bridge autostart [--enable | --disable] [--json] [--port N] [--bind H]",
         "update" => "freepi-bridge update [--check] [--tag vX.Y.Z]",
         "version" => "freepi-bridge version",
         _ => return false,
@@ -128,6 +137,15 @@ fn parse(argv: Vec<String>) -> Result<Flags, String> {
             "--check" => flags.check = true,
             "--yes" | "-y" => flags.yes = true,
             "--init" => flags.init = true,
+            "--set" => {
+                index += 1;
+                let value = argv
+                    .get(index)
+                    .ok_or("--set needs KEY=VALUE, e.g. --set FREEPI_AUTO_UPDATE=off")?;
+                flags.set = Some(value.clone());
+            }
+            "--enable" => flags.enable = true,
+            "--disable" => flags.disable = true,
             "--tag" => {
                 index += 1;
                 let value = argv.get(index).ok_or("--tag needs a release tag, e.g. v0.1.2")?;
@@ -324,7 +342,7 @@ async fn cmd_start(flags: Flags) -> i32 {
 
     let host = flags.bind.clone().unwrap_or_else(default_host);
     let port = flags.port.unwrap_or_else(default_port);
-    let insecure = flags.insecure || env_nonempty("FREEPI_BRIDGE_INSECURE").as_deref() == Some("1");
+    let insecure = flags.insecure || config::flag("FREEPI_BRIDGE_INSECURE");
 
     if !guard_bind(&host, insecure) {
         return 1;
@@ -338,7 +356,6 @@ async fn cmd_start(flags: Flags) -> i32 {
                 return 1;
             }
         };
-        auto_update().await;
         return spawn_detached(&exe, &host, port).await;
     }
 
@@ -364,6 +381,10 @@ async fn cmd_start(flags: Flags) -> i32 {
 }
 
 async fn spawn_detached(exe: &Path, host: &str, port: u16) -> i32 {
+    if autostart::active() {
+        eprintln!("the autostart service owns the bridge; use \"freepi-bridge restart\"");
+        return 1;
+    }
     if let Some(state) = read_state() {
         if pid_alive(state.pid) {
             println!(
@@ -752,8 +773,90 @@ fn cmd_ads(flags: Flags) -> i32 {
     0
 }
 
+fn cmd_autostart(flags: Flags) -> i32 {
+    if flags.disable {
+        return match autostart::disable() {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(err) => {
+                eprintln!("autostart: {err}");
+                1
+            }
+        };
+    }
+
+    let running = read_state().filter(|state| pid_alive(state.pid));
+    let host = running
+        .as_ref()
+        .map(|state| state.host.clone())
+        .or_else(|| flags.bind.clone())
+        .unwrap_or_else(default_host);
+    let port = running
+        .as_ref()
+        .map(|state| state.port)
+        .or(flags.port)
+        .unwrap_or_else(default_port);
+
+    if flags.enable {
+        if !guard_bind(&host, flags.insecure) {
+            return 1;
+        }
+        return match autostart::enable(&host, port, flags.insecure) {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(err) => {
+                eprintln!("autostart: {err}");
+                1
+            }
+        };
+    }
+
+    let state = if autostart::active() {
+        "running"
+    } else if autostart::installed() {
+        "enabled, not running"
+    } else {
+        "off"
+    };
+    if flags.json {
+        println!(
+            "{}",
+            json!({ "installed": autostart::installed(), "active": autostart::active() })
+        );
+    } else {
+        println!("autostart {state}");
+        if !autostart::installed() {
+            println!("enable it with: freepi-bridge autostart --enable");
+        }
+    }
+    0
+}
+
 fn cmd_config(flags: Flags) -> i32 {
     let path = config::config_path();
+
+    if let Some(pair) = flags.set.as_deref() {
+        let Some((key, value)) = pair.split_once('=') else {
+            eprintln!("freepi-bridge: --set needs KEY=VALUE, got {pair:?}");
+            return 1;
+        };
+        return match config::set(key.trim(), value.trim()) {
+            Ok(()) => {
+                println!("{key}={value} written to {}", path.display());
+                println!("apply it: freepi-bridge restart");
+                0
+            }
+            Err(err) => {
+                eprintln!("freepi-bridge: {err}");
+                1
+            }
+        };
+    }
+
     match config::ensure_file() {
         Ok(true) => println!("created {}", path.display()),
         Ok(false) => {
@@ -835,6 +938,14 @@ fn cmd_logs(flags: Flags) -> i32 {
 }
 
 async fn cmd_restart(flags: Flags) -> i32 {
+    if autostart::active() {
+        if autostart::restart_service() {
+            println!("service restarted on the new build");
+            return 0;
+        }
+        eprintln!("the autostart service is installed but could not be restarted");
+        return 1;
+    }
     let code = stop_daemon();
     if code != 0 {
         return code;
@@ -849,18 +960,18 @@ async fn cmd_restart(flags: Flags) -> i32 {
     cmd_start(start_flags).await
 }
 
-async fn auto_update() {
+async fn auto_update(can_apply: bool) {
     let mode = update::auto_mode();
-    if mode == update::AutoUpdate::Off || !update::check_due() {
+    if mode == update::AutoUpdate::Off {
         return;
     }
-    let Ok(release) = update::latest_release().await else {
+    let Ok(release) = update::latest_release_cached().await else {
         return;
     };
-    update::mark_checked();
     if !update::is_newer(VERSION, &release.version) {
         return;
     }
+    let mode = if can_apply { mode } else { update::AutoUpdate::Notify };
 
     match mode {
         update::AutoUpdate::Notify => println!(
@@ -882,13 +993,19 @@ async fn auto_update() {
 }
 
 async fn restart_if_running(exe: &Path) {
+    if autostart::active() {
+        if autostart::restart_service() {
+            println!("service restarted on the new build");
+        }
+        return;
+    }
     let Some(state) = read_state() else {
         return;
     };
     if !pid_alive(state.pid) {
         return;
     }
-    let insecure = env_nonempty("FREEPI_BRIDGE_INSECURE").as_deref() == Some("1");
+    let insecure = config::flag("FREEPI_BRIDGE_INSECURE");
     if !guard_bind(&state.host, insecure) {
         println!("daemon left stopped; start it yourself once the bind is allowed");
         return;
@@ -926,7 +1043,7 @@ async fn cmd_update(flags: Flags) -> i32 {
                 asset,
             }
         }
-        None => match update::latest_release().await {
+        None => match update::latest_release_cached().await {
             Ok(release) => release,
             Err(err) => {
                 eprintln!("cannot check for updates: {err}");
@@ -1132,6 +1249,30 @@ async fn cmd_doctor(flags: Flags) -> i32 {
         },
     });
 
+    let latest = update::cached_tag();
+    checks.push(Check {
+        ok: latest
+            .as_deref()
+            .is_none_or(|tag| !update::is_newer(VERSION, &update::normalize_tag(tag))),
+        fatal: false,
+        label: "Update",
+        detail: match latest.as_deref() {
+            Some(tag) if update::is_newer(VERSION, &update::normalize_tag(tag)) => {
+                format!("{tag} available; run \"freepi-bridge update\"")
+            }
+            Some(tag) => format!("{VERSION} is current (latest {tag})"),
+            None => format!("{VERSION} (no check cached yet)"),
+        },
+    });
+    if autostart::installed() && !autostart::active() {
+        checks.push(Check {
+            ok: false,
+            fatal: false,
+            label: "Autostart",
+            detail: "installed but not running; check \"systemctl --user status freepi-bridge\" or re-run autostart --enable".to_string(),
+        });
+    }
+
     if flags.json {
         let payload: Vec<Value> = checks
             .iter()
@@ -1187,6 +1328,22 @@ pub(crate) async fn run(argv: Vec<String>) -> i32 {
         }
     };
 
+    if (flags.enable || flags.disable || flags.set.is_some())
+        && !matches!(command.as_str(), "autostart" | "config")
+    {
+        eprintln!("freepi-bridge: --enable, --disable and --set only apply to autostart and config");
+        return 1;
+    }
+
+    let read_only = matches!(
+        command.as_str(),
+        "status" | "models" | "usage" | "ads" | "token" | "config" | "logs" | "autostart" | "stop"
+            | "doctor"
+    );
+    if command != "update" {
+        auto_update(!read_only).await;
+    }
+
     match command.as_str() {
         "start" => cmd_start(flags).await,
         "stop" => stop_daemon(),
@@ -1201,6 +1358,7 @@ pub(crate) async fn run(argv: Vec<String>) -> i32 {
         "ads" => cmd_ads(flags),
         "config" => cmd_config(flags),
         "update" => cmd_update(flags).await,
+        "autostart" => cmd_autostart(flags),
         other => {
             eprintln!("freepi-bridge: unknown command \"{other}\" (try \"freepi-bridge help\")");
             1
