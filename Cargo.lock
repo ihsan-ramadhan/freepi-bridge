@@ -114,6 +114,7 @@ dependencies = [
 name = "freepi-bridge"
 version = "0.2.2"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
  "http-body",

@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -18,6 +19,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResBody = BoxBody<Bytes, BoxError>;
 
 const META_TTL: Duration = Duration::from_secs(60);
+const AD_CONTEXT_CHARS: usize = 1000;
+const AD_CONTEXT_BYTES: usize = 4096;
+const VISION_MAX_B64: usize = 7 * 1024 * 1024;
 const FALLBACK_VERSION: &str = "0.6.21";
 const DEFAULT_BASE_URL: &str = "https://api.freepi.ai";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,11 +33,13 @@ struct Config {
     credentials: PathBuf,
     auto_ad: bool,
     ad_refresh: Duration,
+    vision_model: String,
 }
 
 struct Meta {
     expires: Instant,
     version: String,
+    default_model: Option<String>,
     models: Vec<Value>,
 }
 
@@ -73,6 +79,213 @@ fn json_error(status: StatusCode, message: &str, kind: &str) -> Response<ResBody
 
 fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+fn request_model(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn with_model(body: &Bytes, model: &str) -> Option<Bytes> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    value.as_object_mut()?.insert("model".to_string(), json!(model));
+    Some(Bytes::from(value.to_string()))
+}
+
+fn message_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn encode_context(user: &str, assistant: &str) -> String {
+    let mut payload = json!({});
+    if !user.is_empty() {
+        payload["user"] = json!(user);
+    }
+    if !assistant.is_empty() {
+        payload["assistant"] = json!(assistant);
+    }
+    URL_SAFE_NO_PAD.encode(payload.to_string())
+}
+
+fn ad_context(body: &Bytes) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let messages = value.get("messages")?.as_array()?;
+    let mut user = String::new();
+    let mut assistant = String::new();
+
+    for message in messages.iter().rev() {
+        let text = clip(
+            message.get("content").map(message_text).unwrap_or_default().trim(),
+            AD_CONTEXT_CHARS,
+        );
+        if text.is_empty() {
+            continue;
+        }
+        match message.get("role").and_then(Value::as_str) {
+            Some("user") if user.is_empty() => user = text,
+            Some("assistant") if assistant.is_empty() => assistant = text,
+            _ => {}
+        }
+        if !user.is_empty() && !assistant.is_empty() {
+            break;
+        }
+    }
+
+    if user.is_empty() && assistant.is_empty() {
+        return None;
+    }
+
+    let mut encoded = encode_context(&user, &assistant);
+    while encoded.len() > AD_CONTEXT_BYTES && (!user.is_empty() || !assistant.is_empty()) {
+        user = clip(&user, user.chars().count() / 2);
+        assistant = clip(&assistant, assistant.chars().count() / 2);
+        encoded = encode_context(&user, &assistant);
+    }
+    Some(encoded)
+}
+
+fn vision_error(status: StatusCode, code: &str, message: &str) -> Response<ResBody> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json_body(&json!({ "error": { "code": code, "message": message } })))
+        .expect("static response")
+}
+
+/// Answers free-pi-cli's `look_at_image` tool with the chat model itself instead
+/// of the paid vision provider, so the image never leaves the free path.
+async fn vision(state: Arc<State>, token: String, session: String, body: Bytes) -> Response<ResBody> {
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return vision_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid JSON body");
+    };
+    let image = payload
+        .get("image_b64")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let media = payload
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let question = payload
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if image.is_empty() || question.is_empty() {
+        return vision_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "image_b64 and question are required",
+        );
+    }
+    if !matches!(media, "image/png" | "image/jpeg" | "image/webp") {
+        return vision_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "media_type must be image/png, image/jpeg or image/webp",
+        );
+    }
+    if image.len() > VISION_MAX_B64 {
+        return vision_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request",
+            "image is larger than 5 MB",
+        );
+    }
+
+    let request = json!({
+        "model": &state.cfg.vision_model,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": question },
+                { "type": "image_url", "image_url": { "url": format!("data:{media};base64,{image}") } },
+            ],
+        }],
+    });
+    let (version, _) = state.meta(Some(&token)).await;
+
+    for attempt in 0..2 {
+        let sent = state
+            .http
+            .post(format!("{}/v1/chat/completions", state.cfg.base_url))
+            .bearer_auth(&token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-client-version", version.as_str())
+            .header("x-session-id", session.as_str())
+            .header("x-turn-id", uuid::Uuid::new_v4().to_string())
+            .json(&request)
+            .timeout(Duration::from_secs(90))
+            .send()
+            .await;
+        let Ok(upstream) = sent else {
+            return vision_error(StatusCode::BAD_GATEWAY, "upstream_error", "upstream unreachable");
+        };
+        let (status, headers, bytes) = match read_upstream(upstream).await {
+            Ok(parts) => parts,
+            Err(_) => {
+                return vision_error(StatusCode::BAD_GATEWAY, "upstream_error", "upstream body failed")
+            }
+        };
+
+        if attempt == 0
+            && status == StatusCode::FORBIDDEN
+            && state.cfg.auto_ad
+            && String::from_utf8_lossy(&bytes).contains("ads_required")
+        {
+            state
+                .report_ad_throttled(&token, &session, Duration::from_secs(10), "user_message", None)
+                .await;
+            continue;
+        }
+        if !status.is_success() {
+            return buffered_response(status, &headers, bytes);
+        }
+
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let text = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if text.is_empty() {
+            return vision_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "the vision model returned no answer",
+            );
+        }
+        return json_ok(&json!({ "text": text, "model": value.get("model") }));
+    }
+    vision_error(StatusCode::BAD_GATEWAY, "upstream_error", "vision retry failed")
+}
+
+fn with_response_model(bytes: Bytes, model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return bytes;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return bytes;
+    };
+    object.insert("model".to_string(), json!(model));
+    Bytes::from(value.to_string())
 }
 
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
@@ -151,9 +364,23 @@ impl State {
                         })
                         .unwrap_or_default();
 
+                    let default_model = payload
+                        .get("default_model")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            models
+                                .first()
+                                .and_then(|model| model.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        });
+
                     *self.meta.lock().await = Some(Meta {
                         expires: Instant::now() + META_TTL,
                         version: version.clone(),
+                        default_model,
                         models: models.clone(),
                     });
                     return (version, models);
@@ -167,10 +394,19 @@ impl State {
         (FALLBACK_VERSION.to_string(), Vec::new())
     }
 
-    async fn report_ad(&self, token: &str, session: &str) -> bool {
+    async fn default_model(&self, token: &str) -> Option<String> {
+        let _ = self.meta(Some(token)).await;
+        self.meta
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|meta| meta.default_model.clone())
+    }
+
+    async fn report_ad(&self, token: &str, session: &str, trigger: &str, context: Option<&str>) -> bool {
         let (version, _) = self.meta(Some(token)).await;
         let timezone = env_nonempty("TZ").unwrap_or_else(|| "UTC".to_string());
-        let request = self
+        let mut request = self
             .http
             .get(format!("{}/ads/next?slot=banner", self.cfg.base_url))
             .bearer_auth(token)
@@ -181,7 +417,11 @@ impl State {
             .header("x-client-arch", std::env::consts::ARCH)
             .header("x-client-timezone", timezone)
             .header("x-client-locale", "en-US")
+            .header("x-ad-trigger", trigger)
             .timeout(Duration::from_secs(5));
+        if let Some(context) = context {
+            request = request.header("x-ad-context", context);
+        }
         let Ok(res) = request.send().await else {
             return false;
         };
@@ -237,13 +477,20 @@ impl State {
         ok
     }
 
-    async fn report_ad_throttled(&self, token: &str, session: &str, min_gap: Duration) -> bool {
+    async fn report_ad_throttled(
+        &self,
+        token: &str,
+        session: &str,
+        min_gap: Duration,
+        trigger: &str,
+        context: Option<&str>,
+    ) -> bool {
         let mut last = self.ad.lock().await;
         if last.is_some_and(|at| at.elapsed() < min_gap) {
             return true;
         }
         *last = Some(Instant::now());
-        self.report_ad(token, session).await
+        self.report_ad(token, session, trigger, context).await
     }
 
     async fn reset_session(&self, token: &str) -> bool {
@@ -389,6 +636,15 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> (Option<String>, Op
     (content_type, retry_after)
 }
 
+async fn read_upstream(
+    upstream: reqwest::Response,
+) -> Result<(StatusCode, reqwest::header::HeaderMap, Bytes), BoxError> {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let bytes = upstream.bytes().await?;
+    Ok((status, headers, bytes))
+}
+
 fn buffered_response(status: StatusCode, headers: &reqwest::header::HeaderMap, bytes: Bytes) -> Response<ResBody> {
     let (content_type, retry_after) = response_headers(headers);
     let mut builder = Response::builder().status(status);
@@ -454,7 +710,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
             "service": "freepi-bridge",
             "version": VERSION,
             "status": "ok",
-            "endpoints": ["/v1/models", "/v1/chat/completions", "/ads/next", "/ads/impression", "/health"],
+            "endpoints": ["/v1/models", "/v1/chat/completions", "/tools/vision", "/ads/next", "/ads/impression", "/health"],
         })));
     }
 
@@ -485,6 +741,21 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
         let token = state.token();
         let (_, models) = state.meta(token.as_deref()).await;
         return Ok(json_ok(&json!({ "object": "list", "data": models })));
+    }
+
+    if method == Method::POST && path == "/tools/vision" {
+        let Some(token) = state.token_for(&req) else {
+            return Ok(json_error(
+                StatusCode::UNAUTHORIZED,
+                "Missing FreePi token. Set FREEPI_TOKEN, or run `npx free-pi-cli@latest` once to sign in.",
+                "auth_error",
+            ));
+        };
+        let session = header_str(&req, "x-session-id")
+            .map(str::to_string)
+            .unwrap_or_else(|| state.session.clone());
+        let body = req.into_body().collect().await?.to_bytes();
+        return Ok(vision(state, token, session, body).await);
     }
 
     if method == Method::POST && (path == "/v1/chat/completions" || path == "/chat/completions") {
@@ -525,35 +796,98 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Res
                 .header(header::CONTENT_TYPE, content_type.as_str())
                 .header("x-client-version", version.as_str())
                 .header("x-session-id", session.as_str())
+                .header("x-turn-id", uuid::Uuid::new_v4().to_string())
                 .body(body.clone())
                 .send()
         };
 
+        let mut body = body;
         let mut upstream = send(&body).await?;
 
         if upstream.status() == StatusCode::FORBIDDEN && state.cfg.auto_ad {
-            let status = upstream.status();
-            let headers = upstream.headers().clone();
-            let bytes = upstream.bytes().await?;
+            let (status, headers, bytes) = read_upstream(upstream).await?;
             if !String::from_utf8_lossy(&bytes).contains("ads_required") {
                 return Ok(buffered_response(status, &headers, bytes));
             }
+            let context = ad_context(&body);
             state
-                .report_ad_throttled(&token, &session, Duration::from_secs(10))
+                .report_ad_throttled(
+                    &token,
+                    &session,
+                    Duration::from_secs(10),
+                    "user_message",
+                    context.as_deref(),
+                )
                 .await;
             upstream = send(&body).await?;
         }
 
+        let mut answered_as: Option<String> = None;
+
         if upstream.status() == StatusCode::CONFLICT {
-            let status = upstream.status();
-            let headers = upstream.headers().clone();
-            let bytes = upstream.bytes().await?;
-            if !String::from_utf8_lossy(&bytes).contains("concurrent_session")
-                || !state.reset_session(&token).await
-            {
+            let (status, headers, bytes) = read_upstream(upstream).await?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+
+            if text.contains("concurrent_session") {
+                if !state.reset_session(&token).await {
+                    return Ok(buffered_response(status, &headers, bytes));
+                }
+                upstream = send(&body).await?;
+            } else if text.contains("model_at_capacity") {
+                let wanted = request_model(&body).unwrap_or_default();
+                let mut last = (status, headers, bytes);
+
+                if state.cfg.auto_ad {
+                    let context = ad_context(&body);
+                    state
+                        .report_ad_throttled(
+                            &token,
+                            &session,
+                            Duration::from_secs(10),
+                            "user_message",
+                            context.as_deref(),
+                        )
+                        .await;
+                    let response = send(&body).await?;
+                    if response.status() != StatusCode::CONFLICT {
+                        return Ok(streaming_response(response, permit));
+                    }
+                    last = read_upstream(response).await?;
+                }
+
+                let (status, headers, bytes) = last;
+                let target = state.default_model(&token).await.unwrap_or_default();
+                let still_full = String::from_utf8_lossy(&bytes).contains("model_at_capacity");
+                let next = if still_full && wanted != target && !target.is_empty() {
+                    with_model(&body, &target)
+                } else {
+                    None
+                };
+                let Some(next) = next else {
+                    return Ok(buffered_response(status, &headers, bytes));
+                };
+                answered_as = Some(wanted);
+                body = next;
+                upstream = send(&body).await?;
+            } else {
                 return Ok(buffered_response(status, &headers, bytes));
             }
-            upstream = send(&body).await?;
+        }
+
+        if let Some(wanted) = answered_as {
+            let json = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"));
+            if upstream.status().is_success() && json {
+                let (status, headers, bytes) = read_upstream(upstream).await?;
+                return Ok(buffered_response(
+                    status,
+                    &headers,
+                    with_response_model(bytes, &wanted),
+                ));
+            }
         }
 
         return Ok(streaming_response(upstream, permit));
@@ -640,6 +974,8 @@ pub(crate) fn build_state() -> State {
         bridge_key: env_nonempty("BRIDGE_API_KEY"),
         credentials: credentials_path(),
         auto_ad: crate::config::flag("FREEPI_AUTO_AD"),
+        vision_model: env_nonempty("FREEPI_VISION_MODEL")
+            .unwrap_or_else(|| "deepseek-v4.1-flash".to_string()),
         ad_refresh: env_nonempty("FREEPI_AD_REFRESH_SECS")
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|secs| *secs >= 30)
@@ -684,12 +1020,20 @@ pub(crate) async fn serve(state: Arc<State>, addr: SocketAddr) -> std::io::Resul
         let keeper = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut trigger = "launch";
             loop {
                 if let Some(token) = keeper.token() {
                     keeper
-                        .report_ad_throttled(&token, &keeper.session, keeper.cfg.ad_refresh)
+                        .report_ad_throttled(
+                            &token,
+                            &keeper.session,
+                            keeper.cfg.ad_refresh,
+                            trigger,
+                            None,
+                        )
                         .await;
                 }
+                trigger = "turn_end";
                 tokio::time::sleep(keeper.cfg.ad_refresh).await;
             }
         });
@@ -723,8 +1067,11 @@ mod tests {
     #[derive(Default)]
     struct Captured {
         requests: StdMutex<Vec<(String, String, String, String, String)>>,
+        bodies: StdMutex<Vec<String>>,
+        ad_headers: StdMutex<Vec<(String, String)>>,
         gate: std::sync::atomic::AtomicBool,
         sessions_full: std::sync::atomic::AtomicBool,
+        capacity: std::sync::atomic::AtomicBool,
     }
 
     async fn mock_upstream(state: Arc<Captured>, addr: SocketAddr) {
@@ -745,13 +1092,26 @@ mod tests {
                             header_str(&req, "x-session-id").unwrap_or_default().to_string(),
                             header_str(&req, "x-turn-id").unwrap_or_default().to_string(),
                         );
+                        let ad_headers = (
+                            header_str(&req, "x-ad-trigger").unwrap_or_default().to_string(),
+                            header_str(&req, "x-ad-context").unwrap_or_default().to_string(),
+                        );
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         state.requests.lock().unwrap().push(headers);
+                        state
+                            .bodies
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&body).into_owned());
+                        if path == "/ads/next" {
+                            state.ad_headers.lock().unwrap().push(ad_headers);
+                        }
 
                         let response = match path.as_str() {
                             "/client-version" => json_ok(&json!({
                                 "min": "0.6.19",
                                 "latest": "0.6.25",
+                                "default_model": "mock-b",
                                 "models": [{ "id": "mock-a" }, { "id": "mock-b" }],
                             })),
                             "/v1/chat/completions" => {
@@ -763,10 +1123,18 @@ mod tests {
                                         .iter()
                                         .any(|(path, _, _, _, _)| path == "/ads/impression");
                                 let blocked = state.sessions_full.load(std::sync::atomic::Ordering::SeqCst);
+                                let capped = state.capacity.load(std::sync::atomic::Ordering::SeqCst)
+                                    && String::from_utf8_lossy(&body).contains("\"mock-a\"");
                                 if blocked {
                                     json_error(
                                         StatusCode::CONFLICT,
                                         "concurrent_session",
+                                        "free_pi_error",
+                                    )
+                                } else if capped {
+                                    json_error(
+                                        StatusCode::CONFLICT,
+                                        "model_at_capacity",
                                         "free_pi_error",
                                     )
                                 } else if gated {
@@ -840,6 +1208,7 @@ mod tests {
                 credentials: PathBuf::from("/nonexistent"),
                 auto_ad,
                 ad_refresh: Duration::from_secs(600),
+                vision_model: "deepseek-v4.1-flash".to_string(),
             },
             http: test_client(),
             meta: Mutex::new(None),
@@ -960,6 +1329,7 @@ mod tests {
         assert_eq!(chat_call.1, "Bearer eyJ-upstream");
         assert_eq!(chat_call.2, "0.6.25");
         assert_eq!(chat_call.3, "session-fixed");
+        assert!(!chat_call.4.is_empty(), "completion must carry x-turn-id");
     }
 
     #[tokio::test]
@@ -1055,7 +1425,7 @@ mod tests {
         let chat = client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth("bridge-secret")
-            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .json(&json!({ "model": "mock-a", "messages": [{ "role": "user", "content": "hi" }] }))
             .send()
             .await
             .unwrap();
@@ -1073,6 +1443,13 @@ mod tests {
             .iter()
             .position(|path| path == "/ads/impression")
             .expect("impression posted");
+        let ad_headers = captured.ad_headers.lock().unwrap();
+        assert_eq!(ad_headers[0].0, "user_message", "ad carries the turn trigger");
+        let context = URL_SAFE_NO_PAD
+            .decode(&ad_headers[0].1)
+            .expect("ad context is base64url");
+        let context: Value = serde_json::from_slice(&context).unwrap();
+        assert_eq!(context["user"], "hi");
         assert!(ad_at < impression_at, "impression must follow the ad request");
         assert_eq!(
             paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
@@ -1114,6 +1491,152 @@ mod tests {
             paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
             2,
             "blocked completion is retried once"
+        );
+    }
+
+    #[test]
+    fn ad_context_takes_the_last_user_and_assistant() {
+        let body = Bytes::from(
+            json!({
+                "model": "m",
+                "messages": [
+                    { "role": "system", "content": "system prompt" },
+                    { "role": "user", "content": "older ask" },
+                    { "role": "assistant", "content": [{ "type": "text", "text": "older reply" }] },
+                    { "role": "user", "content": "newest ask" },
+                    { "role": "assistant", "content": "newest reply" }
+                ]
+            })
+            .to_string(),
+        );
+        let encoded = ad_context(&body).expect("context built");
+        let decoded = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        let value: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(value["user"], "newest ask");
+        assert_eq!(value["assistant"], "newest reply");
+
+        let huge = "x".repeat(8000);
+        let body = Bytes::from(
+            json!({ "messages": [{ "role": "user", "content": huge }] }).to_string(),
+        );
+        let encoded = ad_context(&body).expect("long context built");
+        assert!(encoded.len() <= AD_CONTEXT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn vision_tool_asks_the_chat_model() {
+        let (base, captured) = spawn_bridge().await;
+        let client = test_client();
+
+        let res = client
+            .post(format!("{base}/tools/vision"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({
+                "image_b64": "aGVsbG8=",
+                "media_type": "image/png",
+                "question": "What is this?"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let payload: Value = res.json().await.unwrap();
+        assert_eq!(payload["text"], "pong");
+
+        let bodies = captured.bodies.lock().unwrap();
+        let forwarded = bodies
+            .iter()
+            .find(|body| body.contains("image_url"))
+            .expect("image forwarded as a content part");
+        assert!(forwarded.contains("\"model\":\"deepseek-v4.1-flash\""));
+        assert!(forwarded.contains("data:image/png;base64,aGVsbG8="));
+        assert!(forwarded.contains("What is this?"));
+
+        let bad = client
+            .post(format!("{base}/tools/vision"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({
+                "image_b64": "aGVsbG8=",
+                "media_type": "image/gif",
+                "question": "What is this?"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+        let body: Value = bad.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn capacity_reports_an_ad_before_switching_models() {
+        let (base, captured) = spawn_bridge_opts(Some("bridge-secret"), true).await;
+        captured
+            .capacity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = test_client();
+
+        let chat = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200);
+
+        let paths: Vec<String> = captured
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.0.clone())
+            .collect();
+        let ad_at = paths.iter().position(|path| path == "/ads/impression").expect("ad reported");
+        let switch_at = paths
+            .iter()
+            .rposition(|path| path == "/v1/chat/completions")
+            .expect("completion sent");
+        assert!(ad_at < switch_at, "the ad is reported before the model switch");
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/v1/chat/completions").count(),
+            3,
+            "same model retried once, then the default model"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_at_capacity_falls_back_to_default_model() {
+        let (base, captured) = spawn_bridge_opts(Some("bridge-secret"), false).await;
+        captured
+            .capacity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = test_client();
+
+        let chat = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth("bridge-secret")
+            .json(&json!({ "model": "mock-a", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200, "fallback model answers when mock-a is full");
+        let payload: Value = chat.json().await.unwrap();
+        assert_eq!(payload["model"], "mock-a", "the reply still names the model the client asked for");
+
+        let requests = captured.requests.lock().unwrap();
+        let bodies = captured.bodies.lock().unwrap();
+        let completions: Vec<&String> = requests
+            .iter()
+            .zip(bodies.iter())
+            .filter(|(request, _)| request.0 == "/v1/chat/completions")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(completions.len(), 2, "capacity error is retried once");
+        assert!(completions[0].contains("\"mock-a\""));
+        assert!(
+            completions[1].contains("\"mock-b\""),
+            "retry asks for the server's default model"
         );
     }
 }
