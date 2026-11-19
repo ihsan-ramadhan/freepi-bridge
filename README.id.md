@@ -5,7 +5,7 @@
 **HTTP API kompatibel OpenAI untuk akun FreePi.**<br>
 Satu binary Rust, tanpa runtime dan tanpa layanan tambahan.
 
-![version](https://img.shields.io/badge/version-0.2.2-blue)
+![version](https://img.shields.io/badge/version-0.2.3-blue)
 ![msrv](https://img.shields.io/badge/msrv-1.89%2B-orange)
 ![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
