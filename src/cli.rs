@@ -371,7 +371,16 @@ async fn cmd_start(flags: Flags) -> i32 {
             return 1;
         }
     };
-    match serve(Arc::new(build_state()), addr).await {
+    let me = std::process::id();
+    let tracked = read_state().filter(|state| pid_alive(state.pid));
+    if tracked.is_none() || flags.bind.is_some() || flags.port.is_some() {
+        let _ = write_state(me, &host, port);
+    }
+    let result = serve(Arc::new(build_state()), addr).await;
+    if read_state().is_some_and(|state| state.pid == me) {
+        clear_state();
+    }
+    match result {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("freepi-bridge: {err}");
@@ -481,7 +490,10 @@ fn stop_daemon() -> i32 {
 }
 
 async fn cmd_status(flags: Flags) -> i32 {
-    let Some(state) = read_state() else {
+    let Some(state) = read_state().filter(|state| pid_alive(state.pid)) else {
+        if read_state().is_some() {
+            clear_state();
+        }
         if flags.json {
             println!("{}", json!({ "running": false }));
         } else {
@@ -489,8 +501,7 @@ async fn cmd_status(flags: Flags) -> i32 {
         }
         return 1;
     };
-    let alive = pid_alive(state.pid);
-    let health = if alive { bridge_health(&state.host, state.port).await } else { None };
+    let health = bridge_health(&state.host, state.port).await;
     let healthy = health.is_some();
     let running = health
         .as_ref()
@@ -508,7 +519,7 @@ async fn cmd_status(flags: Flags) -> i32 {
         println!(
             "{}",
             json!({
-                "running": alive,
+                "running": true,
                 "healthy": healthy,
                 "pid": state.pid,
                 "url": url,
